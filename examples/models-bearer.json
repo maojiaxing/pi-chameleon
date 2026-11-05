@@ -1,0 +1,14 @@
+{
+  "providers": {
+    "chameleon-claude": {
+      "baseUrl": "https://relay.example.com",
+      "apiKey": "replace-with-your-relay-api-key",
+      "authHeader": true
+    },
+    "chameleon-codex": {
+      "baseUrl": "https://relay.example.com/v1",
+      "apiKey": "replace-with-your-relay-api-key",
+      "authHeader": true
+    }
+  }
+}

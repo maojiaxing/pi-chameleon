@@ -1,0 +1,251 @@
+# pi-chameleon
+
+Pi 扩展：使用你自己的中转 API key，将 Pi 的真实对话适配为 **Claude Code** 或 **Codex CLI** 请求格式。
+
+**配置完全使用 Pi 原生的 `settings.json`、`models.json` 和凭据机制**
+
+| Provider | 线格式 | 默认认证 | 已适配 CLI |
+|---|---|---|---|
+| `chameleon-claude` | Anthropic Messages | `x-api-key` | Claude Code `2.1.302` |
+| `chameleon-codex` | OpenAI Responses | `Authorization: Bearer` | Codex CLI `0.166.0` |
+
+中转站要求两者都使用 Bearer 时，可以使用 Pi 原生的 `authHeader: true`，见下方示例。
+
+## 快速开始
+
+### 1. 加载扩展
+
+已验证 Pi **1.5.0**；对应 Node.js 要求为 **22.19.0 或更高版本**。在本项目目录中执行：
+
+```bash
+npm ci
+pi -e .
+```
+
+`-e .` 只为这次启动加载扩展。长期使用可以执行：
+
+```bash
+pi install /absolute/path/to/pi-chameleon
+```
+
+或者把本项目的绝对路径加入 Pi 的 `settings.json`：
+
+```json
+{
+  "packages": ["path/to/pi-chameleon"],
+  "defaultProvider": "chameleon-codex",
+  "defaultModel": "gpt-5.3-codex",
+  "defaultThinkingLevel": "medium"
+}
+```
+
+Windows 路径在 JSON 中可直接使用 `/`；macOS/Linux 改为自己的绝对路径。请将示例字段**合并**到已有配置，不要覆盖其他 packages 或设置。完整示例：[examples/settings.json](examples/settings.json)。
+
+### 2. 在 Pi 的 models.json 中配置中转站
+
+默认配置位置：
+
+| 文件 | macOS / Linux | Windows |
+|---|---|---|
+| 扩展与默认模型 | `~/.pi/agent/settings.json` | `$HOME\.pi\agent\settings.json` |
+| 中转地址、key、模型覆盖 | `~/.pi/agent/models.json` | `$HOME\.pi\agent\models.json` |
+
+如果使用 Pi 原生的 `PI_CODING_AGENT_DIR`，这些文件位于该目录下，而不是本项目目录。`examples/` 中的文件只是模板，插件不会自动加载它们。
+
+**同一中转站支持 Claude 和 Codex、共用同一个 key：**
+
+```json
+{
+  "providers": {
+    "chameleon-claude": {
+      "baseUrl": "https://relay.example.com",
+      "apiKey": "replace-with-your-relay-api-key"
+    },
+    "chameleon-codex": {
+      "baseUrl": "https://relay.example.com/v1",
+      "apiKey": "replace-with-your-relay-api-key"
+    }
+  }
+}
+```
+
+将两处 `apiKey` 替换为同一个真实 key，将域名换成你的中转站。完整示例：[examples/models.json](examples/models.json)。
+
+两个 provider 独立配置，这是 Pi 原生语义；**没有**额外的共享 key、继承或自动回退字段。已注册默认模型，无需在最小配置中重复填写 `api` 或 `models`。
+
+### 3. 选择模型
+
+保存配置后重新启动 Pi；已运行的 Pi 可先 `/reload`，再打开 `/model`（Pi 会重新读取 `models.json`）：
+
+```text
+/model chameleon-claude/claude-opus-4-6
+/model chameleon-codex/gpt-5.3-codex
+```
+
+也可以从项目目录检查注册结果：
+
+```bash
+pi -e . --list-models chameleon
+```
+
+模型出现只表示扩展与凭据配置已被 Pi 识别，**不代表真实中转站已接受该指纹或模型可用**。
+
+## 配置示例
+
+### A. 两种协议都使用 Bearer 认证
+
+如果中转站要求 Claude 和 Codex 都发送 `Authorization: Bearer <key>`，为两个 provider 设置 Pi 原有的 `authHeader: true`：
+
+```json
+{
+  "providers": {
+    "chameleon-claude": {
+      "baseUrl": "https://relay.example.com",
+      "apiKey": "replace-with-your-relay-api-key",
+      "authHeader": true
+    },
+    "chameleon-codex": {
+      "baseUrl": "https://relay.example.com/v1",
+      "apiKey": "replace-with-your-relay-api-key",
+      "authHeader": true
+    }
+  }
+}
+```
+
+完整示例：[examples/models-bearer.json](examples/models-bearer.json)。扩展保留 Pi 根据当前 key 生成的 Bearer 认证，Claude 不会再同时发送 `x-api-key`。
+
+`apiKey` 表示凭据，`authHeader` 控制 Pi 是否显式生成 Bearer 头；不要填写自定义的 `authKey` 字段。Codex 自身默认就使用 Bearer，不设置 `authHeader` 也不会变成 `x-api-key` 认证。
+
+### B. Claude 和 Codex 使用不同中转站或 key
+
+两个条目的 `baseUrl`、`apiKey` 分别填写即可，不影响彼此。示例同时展示模型输出上限覆盖：
+
+```json
+{
+  "providers": {
+    "chameleon-claude": {
+      "baseUrl": "https://claude-relay.example.com",
+      "apiKey": "replace-with-your-claude-api-key",
+      "modelOverrides": {
+        "claude-opus-4-6": { "maxTokens": 8192 }
+      }
+    },
+    "chameleon-codex": {
+      "baseUrl": "https://codex-relay.example.com/v1",
+      "apiKey": "replace-with-your-codex-api-key",
+      "modelOverrides": {
+        "gpt-5.3-codex": {
+          "maxTokens": 8192,
+          "samplingParams": { "max_output_tokens": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+完整示例：[examples/models-separate.json](examples/models-separate.json)。仅使用一种协议时，只保留对应 provider 条目；另一种没有其他已存凭据时不会列为可用模型。
+
+`modelOverrides` 修改既有模型，不替换整个目录。Codex 默认省略 SDK 推导出的 `max_output_tokens`；需要明确发送输出上限时，像上例一样使用 Pi 原生的 `samplingParams.max_output_tokens`。
+
+### C. 添加中转站特有的模型 ID
+
+在对应 provider 下添加原生 `models` 条目即可。以下片段合并到完整 provider 配置中；示例模型 ID 必须换成中转站实际支持的名称：
+
+```json
+{
+  "models": [
+    {
+      "id": "your-relay-codex-model",
+      "name": "Relay Codex",
+      "api": "openai-responses",
+      "reasoning": true,
+      "input": ["text", "image"],
+      "contextWindow": 128000,
+      "maxTokens": 8192
+    }
+  ]
+}
+```
+
+上下文、输出上限、成本和 thinking 支持应按实际模型填写。同名 `models` 条目按 Pi 原生语义替换模型；只调整已有模型的字段，优先使用 `modelOverrides`。Claude 模型使用 `anthropic-messages`，Codex 模型使用 `openai-responses`；改成其他协议不属于本扩展的伪装范围。
+
+### baseUrl 如何填写
+
+扩展不再补 `/v1`，不猜测中转站地址；路径拼接遵循对应 Pi 原生协议：
+
+| Provider | `baseUrl` 示例 | 最终请求 |
+|---|---|---|
+| Claude | `https://relay.example.com` | `/v1/messages?beta=true` |
+| Codex | `https://relay.example.com/v1` | `/v1/responses` |
+| Codex，自定义网关前缀 | `https://relay.example.com/gateway/openai` | `/gateway/openai/responses` |
+
+不要将完整的 `/v1/messages` 或 `/v1/responses` 请求地址当成 `baseUrl`。例如 Codex 配置根地址时会请求 `/responses`，**不会自动改成 `/v1/responses`**。
+
+### 凭据与覆盖顺序
+
+- `apiKey` 可以直接填字符串；也可以使用 Pi 原生支持的 `$NAME` / `${NAME}` 或 `!command`。这些由 Pi 解析，扩展没有额外的环境变量约定或 `.env` 加载器。
+- `auth.json` 中已保存的凭据可能优先于 `models.json.apiKey`，运行时 key 也可覆盖它；遵循 Pi 自身的凭据优先级。修改 key 后未生效时，先检查是否存在旧凭据。
+- 普通 `headers` 由 Pi 解析后透传。CLI 指纹头和凭据安全规则仍由扩展强制执行；其他身份令牌、cookie、代理认证等不会随请求混发。
+- 扩展只注册行为与模型目录。没有 key 时由 Pi 判断不可用；有 key 但缺少 `baseUrl` 时请求会明确报错，不会落到猜测的官方上游。
+- 不要提交含真实 key 的 `models.json`，也不要将 key 写在 URL、日志或截图中。示例文件只包含占位值。
+
+## 默认模型
+
+| Provider | 模型 ID | 上下文上限 | 模型输出上限 |
+|---|---|---:|---:|
+| `chameleon-claude` | `claude-opus-5-5` / `claude-opus-4-6` / `claude-sonnet-4-6` | 1,000,000 | 128,000 |
+| `chameleon-codex` | `gpt-5.3-codex` | 400,000 | 128,000 |
+| `chameleon-codex` | `gpt-5.4` / `gpt-5.5` | 272,000 | 128,000 |
+
+元数据与成本取自本项目固定的 pi-ai 1.5.0 目录，不是实时服务端发现。能否使用以及实际配额、限额，以中转站为准。
+
+## Claude 伪装
+
+- 指纹固定为 `claude-cli/2.1.302 (external, cli)`，不追加 Pi UA；发送用户抓包顺序的 11 项 beta。
+- Stainless header 指纹固定为 Windows/x64/node v26.3.0、package 0.128.0、retry count 0、timeout 60000；这是 header 指纹，不代表真实运行环境。实际请求超时由 Pi 的 `timeoutMs` 决定，默认 600 秒。
+- `metadata.user_id.session_id` 与 `x-claude-code-session-id` 一致；device ID 为进程级随机值，trace ID 每次请求重新生成，不复用抓包标识。
+- system 保留两块：CLI 身份块，以及通用 Claude Code 模板 + 完整 Pi 运行指令。模板由 `src/claude/prompts.ts` 管理，仅替换开头的 Pi 身份，保留规则、工具说明、技能和真实环境；真实运行指令优先于通用 Harness 描述。
+- 不添加 billing 或 Agent SDK 身份；移除旧版独立前缀，但不改写项目文本中的引用。空提示和重复适配都不会叠加前缀。
+- 工具名双向映射：出站使用 Claude Code 风格，事件流和最终结果恢复 Pi 名称；工具 schema、参数和用户数据不变。
+- adaptive thinking 使用 Pi 当前 effort，`display: updates`；支持真实中途 system 更新的 per-turn effort，不强制 `max` 或覆盖显式输出上限。
+- 不伪造 `/model` 历史、记忆、环境路径、技能清单、token 余额或 Claude 专属工具。
+
+协议转换、SSE、usage 和取消委托 Pi 原生 `anthropic-messages` 实现。历史受限实测两端均返回 429，不能证明已通过全部校验。
+
+## Codex 伪装
+
+- 固定官方 `rust-v0.166.0` 请求格式：`originator: codex_cli_rs`、`version: 0.166.0`、同一会话的 `session-id` / `thread-id` / `x-client-request-id`。
+- UA 按官方格式组合真实本机 OS、架构和可检测到的终端信息，缺失终端信息用 `unknown`。移除 TS SDK 的 `x-stainless-*` 及 Claude/OAuth 痕迹头。
+- `store:false`，保留 `reasoning.encrypted_content` 以支持多轮；默认自动工具选择和并行工具调用，保留调用方显式设置。
+- 新版基础指令放在 developer input；旧顶层 `instructions` 会被迁移而不丢失。仅使用公开身份句，其余为 Pi 真实运行指令，不搬运完整 CLI 环境或工具清单。
+- 移除不属于固定 CLI 请求格式的 `temperature` 和 prompt-cache 扩展字段；显式输出上限保留，SDK 推导的默认上限不发送。
+- 工具名不改写，历史 tool call ID、reasoning 签名、SSE、usage 和取消由 Pi 原生 `openai-responses` 处理；不走 ChatGPT OAuth backend。
+
+## 常见问题
+
+| 现象 | 检查项 |
+|---|---|
+| `/model` 找不到 chameleon 模型 | 扩展是否加载；`models.json` 是否放在当前 Pi agent 目录；provider 名与 key 是否正确 |
+| `configure ... baseUrl in Pi models.json` | 对应 provider 缺少 `baseUrl`；扩展不会猜测端点 |
+| 404 或 endpoint 错误 | 检查 Claude 根地址、Codex `/v1` 及网关前缀；不要填完整请求路径 |
+| Claude 返回 401，但同一 key 的 Codex 正常 | 中转站可能只接受 Bearer；尝试该站要求的原生 `authHeader: true` |
+| 改 key 后仍使用旧 key | 检查 Pi 已保存的 `auth.json` 凭据和运行时 key，再 `/reload` / `/model` |
+| 设置了 `CHAMELEON_*` 但没有生效 | 自定义环境变量配置已移除；按本文迁移到 Pi 原生 `models.json` |
+| 返回 429 或指纹校验失败 | 可能是模型配额、限流或中转站私有规则；模型注册成功不等于服务端兼容 |
+
+## 开发与验证
+
+```bash
+npm ci
+npm test
+npm run check
+```
+
+测试使用合成 key、注入 fetch 和临时 Pi 配置，不向真实中转站发送请求；包含真实 Pi 1.5.0 扩展加载、`models.json` 配置/覆盖/刷新、凭据优先级、双协议认证、SSE 和多轮工具调用。
+
+
+## 风险提示
+
+仅用于你已获授权的中转服务，并遵守其条款。拒绝跨 origin、重定向、非 HTTP(S) 地址和 URL 内联凭据；不会伪造账号、订阅或 attestation 信息。离线测试不证明中转站接受某个 CLI 指纹，版本变化可能要求同步更新适配。

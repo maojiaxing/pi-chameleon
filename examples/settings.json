@@ -1,0 +1,6 @@
+{
+  "packages": ["C:/path/to/pi-disguiser"],
+  "defaultProvider": "chameleon-codex",
+  "defaultModel": "gpt-5.3-codex",
+  "defaultThinkingLevel": "medium"
+}
