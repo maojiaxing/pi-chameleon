@@ -3,7 +3,10 @@ import { CLAUDE_CODE_IDENTITY, EPHEMERAL } from "./identity.ts";
 interface SystemTextBlock {
 	type: "text";
 	text: string;
-	cache_control?: typeof EPHEMERAL;
+	cache_control?: unknown;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -42,68 +45,67 @@ The following instructions describe this session's actual runtime. Use its tool 
 
 `;
 
-/** Replace only the leading Pi identity, retaining all actual runtime content. */
-function replacePiIdentity(text: string): string {
-	return text
-		.replace(
-			/^(\s*)You are an expert coding assistant operating inside pi(?:\.(?=\s|$)|(?=\s|$))/,
-			`$1${CLAUDE_CODE_IDENTITY}`,
-		)
-		.replace(
-			/^(\s*)You are a coding assistant running inside pi, a coding agent harness(?:\.(?=\s|$)|(?=\s|$))/,
-			`$1${CLAUDE_CODE_IDENTITY}`,
-		);
-}
+const OLD_INSTRUCTIONS_PREFIX = "[System Instructions]\n";
+const OLD_ACK = "Understood. I will follow these instructions.";
+const SDK_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const isBilling = (text: string) => /^x-anthropic-billing-header:[^\r\n]*cc_entrypoint=[^\r\n]*$/.test(text);
 
-function composeClaudeCodePrompt(piPrompt: string): string {
-	const runtime = piPrompt.startsWith(CLAUDE_CODE_PROMPT_PREFIX)
-		? piPrompt.slice(CLAUDE_CODE_PROMPT_PREFIX.length)
-		: piPrompt;
-	return `${CLAUDE_CODE_PROMPT_PREFIX}${replacePiIdentity(runtime)}`;
+function textBlocks(value: unknown): SystemTextBlock[] {
+	if (value == null) return [];
+	if (typeof value === "string") return [{ type: "text", text: value }];
+	if (!Array.isArray(value)) throw new Error("Claude system prompt must be a string or text-block array");
+	return value.map((block) => {
+		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") {
+			throw new Error("Claude system prompt contains a non-text block");
+		}
+		return { ...block, type: "text", text: block.text };
+	});
+}
+function onlyText(message: unknown, role: string): string | undefined {
+	if (!isRecord(message) || message.role !== role || !Array.isArray(message.content) || message.content.length !== 1) return undefined;
+	const block = message.content[0];
+	return isRecord(block) && block.type === "text" && typeof block.text === "string" ? block.text : undefined;
 }
 
 /**
- * [Claude Code CLI identity] + [Claude Code core + Pi prompt].
- * No billing block (removed at the user's request; successful captures pass
- * without it). Pi's serialized text remains in order inside the runtime
- * section of the adapted main prompt. Compatibility prefixes from previous
- * rewrites — including legacy billing markers — are stripped, not duplicated.
+ * Real-capture layout: two fixed system blocks; actual Pi instructions remain
+ * system-role content at the start of messages, not synthetic conversation.
+ * Only exact templates emitted by this project are unwrapped on replay.
  */
-export function claudeCodeSystem(system: unknown): SystemTextBlock[] {
-	const blocks =
-		typeof system === "string"
-			? [{ type: "text", text: system }]
-			: system == null
-				? []
-				: system;
-	if (!Array.isArray(blocks))
-		throw new Error("Claude system prompt must be a string or text-block array");
-
-	const texts = blocks.map((block: unknown): string => {
-		if (
-			typeof block !== "object" || block === null ||
-			!("type" in block) || block.type !== "text" ||
-			!("text" in block) || typeof block.text !== "string"
-		) {
-			throw new Error("Claude system prompt contains a non-text block");
+export function claudeCodePrompt(source: Record<string, unknown>): { system: SystemTextBlock[]; messages: unknown[] } {
+	const blocks = textBlocks(source.system);
+	const originalMessages = source.messages ?? [];
+	if (!Array.isArray(originalMessages)) throw new Error("Claude messages must be an array");
+	const messages = [...originalMessages];
+	const texts = blocks.map((block) => block.text);
+	const oldEnvelope = texts.length === 3 && isBilling(texts[0]) &&
+		texts[1] === CLAUDE_CODE_IDENTITY && texts[2] === CLAUDE_CODE_CORE_PROMPT;
+	let runtime: string;
+	if (oldEnvelope) {
+		// Migrate only the previous converter's exact synthetic preface. Never
+		// remove ordinary user/assistant messages merely resembling an ACK.
+		const instruction = onlyText(messages[0], "user");
+		if (instruction?.startsWith(OLD_INSTRUCTIONS_PREFIX) && onlyText(messages[1], "assistant") === OLD_ACK) {
+			runtime = instruction.slice(OLD_INSTRUCTIONS_PREFIX.length);
+			messages.splice(0, 2);
+		} else {
+			runtime = "";
 		}
-		return block.text;
-	});
-
-	// Only remove standalone leading compatibility blocks. Identical text
-	// appearing later in rules, examples or project context is not rewritten.
-	while (texts[0] !== undefined && /^x-anthropic-billing-header:[^\r\n]*$/.test(texts[0].trim())) {
-		texts.shift();
+	} else {
+		while (texts[0] !== undefined && isBilling(texts[0].trim())) texts.shift();
+		if (texts[0] === SDK_IDENTITY) texts.shift();
+		if (texts[0] === CLAUDE_CODE_IDENTITY) texts.shift();
+		if (texts[0]?.startsWith(CLAUDE_CODE_PROMPT_PREFIX)) texts[0] = texts[0].slice(CLAUDE_CODE_PROMPT_PREFIX.length);
+		runtime = texts.join("\n\n");
 	}
-	// Migrate the old prefix, without ever emitting the Agent SDK identity.
-	if (texts[0]?.trim() === "You are a Claude agent, built on Anthropic's Claude Agent SDK.") {
-		texts.shift();
+	if (runtime.length > 0 && onlyText(messages[0], "system") !== runtime) {
+		messages.unshift({ role: "system", content: [{ type: "text", text: runtime }] });
 	}
-	if (texts[0]?.trim() === CLAUDE_CODE_IDENTITY) texts.shift();
-
-	const prompt = composeClaudeCodePrompt(texts.filter((text) => text.length > 0).join("\n\n"));
-	return [
-		{ type: "text", text: CLAUDE_CODE_IDENTITY, cache_control: EPHEMERAL },
-		{ type: "text", text: prompt, cache_control: EPHEMERAL },
-	];
+	return {
+		system: [
+			{ type: "text", text: CLAUDE_CODE_IDENTITY, cache_control: EPHEMERAL },
+			{ type: "text", text: CLAUDE_CODE_PROMPT_PREFIX, cache_control: EPHEMERAL },
+		],
+		messages,
+	};
 }

@@ -17,6 +17,15 @@ const BETAS = [
 	"afk-mode-2026-01-31",
 ] as const;
 
+/** Native serializer profile matching the user's actual Aether wire capture. */
+export const CLAUDE_SERIALIZER_COMPAT = {
+	supportsMidConvoSystemMessages: true,
+	supportsMidConvoEffort: false,
+	supportsMidConvoToolChanges: false,
+	supportsStrictTools: false,
+	supportsEagerToolInputStreaming: false,
+} as const;
+
 export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 export const EPHEMERAL = { type: "ephemeral" } as const;
 export const CONTEXT_MANAGEMENT = {

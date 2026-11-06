@@ -3,14 +3,12 @@ import { test } from "node:test";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { claudeCodeStreamSimple } from "../src/claude/stream.ts";
 import { claudePayloadAdapter } from "../src/claude/payload.ts";
-import { claudeCodeSystem } from "../src/claude/prompts.ts";
+import { claudeCodePrompt } from "../src/claude/prompts.ts";
 import {
 	API_KEY, SESSION_ID, CLAUDE_IDENTITY, claudeModel, claudeTextResponse,
 	capture, object, array,
 } from "./fixtures.ts";
 
-// Normal prompt behavior is tested through streamSimple. Internal seams below
-// cover malformed/legacy wire forms and repeated assembly the SDK can't emit.
 async function request(prompt?: string) {
 	const mock = capture(claudeTextResponse);
 	const result = await claudeCodeStreamSimple(claudeModel(), normalizeContext({
@@ -20,83 +18,114 @@ async function request(prompt?: string) {
 	return mock.requests[0].body;
 }
 
-test("Claude request preserves runtime/project text, replaces only the initial identity and caches the final user", async () => {
+test("Claude prompt retains exact Pi text and its system role, without changing quoted identities", async () => {
 	const prompt = "You are an expert coding assistant operating inside pi. Help users.\n\n<rules>Example: You are an expert coding assistant operating inside pi.</rules>\n<cwd>/actual/project</cwd>";
 	const body = await request(prompt);
 	const system = array(body.system).map(object);
 	assert.equal(system.length, 2);
 	assert.equal(system[0].text, CLAUDE_IDENTITY);
-	const main = String(system[1].text);
-	assert.ok(main.endsWith(prompt.replace("You are an expert coding assistant operating inside pi.", CLAUDE_IDENTITY)));
-	assert.ok(main.includes("# Runtime instructions"));
-	assert.ok(main.includes("Runtime-specific instructions take precedence"));
+	assert.ok(String(system[1].text).includes("# Runtime instructions"));
+	assert.ok(!String(system[1].text).includes(prompt));
 	for (const block of system) assert.deepEqual(block.cache_control, { type: "ephemeral" });
-	const user = array(body.messages).map(object).findLast((message) => message.role === "user");
-	assert.ok(user);
-	assert.deepEqual(object(array(user.content)[0]).cache_control, { type: "ephemeral" });
+	const messages = array(body.messages).map(object);
+	assert.equal(messages[0].role, "system");
+	assert.equal(object(array(messages[0].content)[0]).text, prompt);
+	assert.equal(messages[0].output_config, undefined);
+	assert.deepEqual(object(array(messages[1].content)[0]).cache_control, { type: "ephemeral" });
 	assert.deepEqual(body.context_management, { edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
 });
 
-test("empty runtime still sends a two-block Claude core without fabricated capabilities", async () => {
+test("empty runtime uses the two fixed capture blocks without invented conversation or capabilities", async () => {
 	const body = await request();
-	const blocks = array(body.system).map(object);
-	assert.equal(blocks.length, 2);
-	assert.equal(blocks[0].text, CLAUDE_IDENTITY);
-	const text = String(blocks[1].text);
+	const system = array(body.system).map(object);
+	assert.equal(system.length, 2);
+	assert.equal(system[0].text, CLAUDE_IDENTITY);
+	const text = String(system[1].text);
 	assert.ok(text.startsWith("You are an agent working with the user toward their goals, using your own judgment along the way."));
 	for (const section of ["# Harness", "# Context management", "# Runtime instructions"]) assert.ok(text.includes(section));
-	for (const omitted of ["# Memory", "# Environment", "<total_tokens>", "Available agent types", "Set model to", "Claude Agent SDK"]) assert.ok(!text.includes(omitted), omitted);
+	for (const omitted of ["# Memory", "# Environment", "<total_tokens>", "Available agent types", "Claude Agent SDK", "x-anthropic-billing-header"]) assert.ok(!text.includes(omitted));
+	assert.deepEqual(array(body.messages).map((message) => object(message).role), ["user"]);
 });
 
-test("prompt module handles legacy prefix cleanup, multiple blocks, quoting and repeated assembly", () => {
+test("standalone legacy prefixes are removed but text blocks, blank space and quoted content survive", () => {
 	const billing = "x-anthropic-billing-header: cc_version=2.1.220.e92; cc_entrypoint=sdk-cli;";
-	const quoted = `<project_context>Example text: ${billing}</project_context>`;
-	const source = [
+	const runtime = "Keep rules.  ";
+	const quoted = `<project_context>Example: ${billing}</project_context>`;
+	const source = { system: [
 		{ type: "text", text: billing },
 		{ type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
-		{ type: "text", text: "You are a coding assistant running inside pi, a coding agent harness. Keep rules." },
+		{ type: "text", text: runtime },
+		{ type: "text", text: "" },
 		{ type: "text", text: quoted },
-	];
+	], messages: [{ role: "user", content: "hello" }] };
 	const before = structuredClone(source);
-	const blocks = claudeCodeSystem(source);
-	assert.equal(blocks.length, 2);
-	assert.equal(blocks[0].text, CLAUDE_IDENTITY);
-	assert.ok(blocks[1].text.endsWith(`${CLAUDE_IDENTITY} Keep rules.\n\n${quoted}`));
-	assert.ok(!blocks[1].text.includes("Claude Agent SDK"));
-	assert.deepEqual(claudeCodeSystem(blocks), blocks);
+	const once = claudeCodePrompt(source);
+	assert.equal(object(once.messages[0]).role, "system");
+	assert.equal(object(array(object(once.messages[0]).content)[0]).text, `${runtime}\n\n\n\n${quoted}`);
+	assert.deepEqual(claudeCodePrompt(once), once);
 	assert.deepEqual(source, before);
-	assert.deepEqual(claudeCodeSystem(undefined), claudeCodeSystem([]));
-	assert.deepEqual(claudeCodeSystem("Keep rules."), claudeCodeSystem([{ type: "text", text: "Keep rules." }]));
-	assert.throws(() => claudeCodeSystem({ text: "invalid" }), /string or text-block array/);
-	assert.throws(() => claudeCodeSystem([{ type: "image", text: "invalid" }]), /non-text block/);
+	assert.throws(() => claudeCodePrompt({ system: { text: "invalid" } }), /string or text-block array/);
+	assert.throws(() => claudeCodePrompt({ system: [{ type: "image", text: "invalid" }] }), /non-text block/);
+	assert.throws(() => claudeCodePrompt({ messages: "invalid" }), /messages must be an array/);
 });
 
-test("Claude payload lifecycle is idempotent, updates effort and does not mutate source", async () => {
+test("old appended Runtime prefix unwraps into a single first system message", () => {
+	const prefix = claudeCodePrompt({}).system[1].text;
+	const runtime = `${CLAUDE_IDENTITY} Keep my actual runtime rules.\n\n<rules>Quoted # Runtime instructions remains data.</rules>`;
+	const source = { system: [{ type: "text", text: CLAUDE_IDENTITY }, { type: "text", text: prefix + runtime }], messages: [{ role: "user", content: "analyze" }] };
+	const once = claudeCodePrompt(source);
+	assert.equal(object(once.messages[0]).role, "system");
+	assert.equal(object(array(object(once.messages[0]).content)[0]).text, runtime);
+	assert.deepEqual(claudeCodePrompt(once), once);
+});
+
+test("only this project's exact prior billing/ACK envelope is migrated, not arbitrary user history", () => {
+	const current = claudeCodePrompt({});
+	const core = current.system[1].text.split("\n\n# Runtime instructions\n")[0];
+	const runtime = "Keep all Pi instructions.";
+	const source = {
+		system: [
+			{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli;" },
+			{ type: "text", text: CLAUDE_IDENTITY },
+			{ type: "text", text: core },
+		],
+		messages: [
+			{ role: "user", content: [{ type: "text", text: `[System Instructions]\n${runtime}` }] },
+			{ role: "assistant", content: [{ type: "text", text: "Understood. I will follow these instructions." }] },
+			{ role: "user", content: "real task" },
+		],
+	};
+	const migrated = claudeCodePrompt(source);
+	assert.deepEqual(migrated.messages.map((message) => object(message).role), ["system", "user"]);
+	assert.equal(object(array(object(migrated.messages[0]).content)[0]).text, runtime);
+	assert.deepEqual(claudeCodePrompt(migrated), migrated);
+	const unrelated = claudeCodePrompt({ system: "Different system", messages: source.messages });
+	assert.equal(unrelated.messages.length, 4);
+	assert.deepEqual(unrelated.messages.slice(1), source.messages);
+});
+
+test("effort-only markers are removed but later rules and non-effort config survive unchanged", async () => {
 	const input = {
-		system: [{ type: "text", text: "Keep rules." }],
+		system: "Keep rules.",
 		thinking: { type: "adaptive", display: "summarized", block_binding: { prefix_mismatch_behavior: "drop_block" } },
 		output_config: { effort: "low", format: { type: "json_schema" } },
 		messages: [
 			{ role: "system", content: [], output_config: { effort: "low" } },
-			{ role: "assistant", content: [{ type: "text", text: "Old reply" }] },
 			{ role: "user", content: [{ type: "text", text: "New prompt" }] },
-			{ role: "system", content: [{ type: "text", text: "Real environment" }] },
-			{ role: "system", content: [], output_config: { effort: "max" } },
+			{ role: "system", content: [{ type: "text", text: "Real environment" }], output_config: { effort: "max", format: { type: "json_schema" } } },
 		],
 	};
 	const before = structuredClone(input);
 	const adapter = claudePayloadAdapter(SESSION_ID);
-	const body = object(await adapter.onPayload(input, claudeModel()));
-	assert.deepEqual(body.thinking, { type: "adaptive", display: "updates" });
-	assert.deepEqual(body.output_config, { effort: "max", format: { type: "json_schema" } });
-	const messages = array(body.messages).map(object);
-	assert.equal(messages.length, 4);
-	assert.deepEqual(messages[0].output_config, { effort: "low" });
-	assert.deepEqual(messages[3].output_config, { effort: "max" });
-	assert.equal(object(array(messages[3].content)[0]).text, "Real environment");
+	const once = object(await adapter.onPayload(input, claudeModel()));
+	assert.deepEqual(once.thinking, { type: "adaptive", display: "updates" });
+	assert.deepEqual(once.output_config, input.output_config);
+	const messages = array(once.messages).map(object);
+	assert.deepEqual(messages.map((message) => message.role), ["system", "user", "system"]);
+	assert.equal(object(array(messages[2].content)[0]).text, "Real environment");
+	assert.deepEqual(messages[2].output_config, { format: { type: "json_schema" } });
 	assert.deepEqual(input, before);
-	const twice = object(await adapter.onPayload(body, claudeModel()));
-	assert.deepEqual(twice.system, body.system);
+	assert.deepEqual(await adapter.onPayload(once, claudeModel()), once);
 	assert.equal(await adapter.onPayload(null, claudeModel()), null);
 	assert.equal(await adapter.onPayload(undefined, claudeModel()), undefined);
 });

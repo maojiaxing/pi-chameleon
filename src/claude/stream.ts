@@ -2,7 +2,7 @@
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
 import type { Api, Model, SimpleStreamOptions, StreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { prepareRelayRequest } from "../relay-transport.ts";
-import { CLAUDE_PROFILE } from "./identity.ts";
+import { CLAUDE_PROFILE, CLAUDE_SERIALIZER_COMPAT } from "./identity.ts";
 import { claudePayloadAdapter } from "./payload.ts";
 import { restoredStream } from "./tools.ts";
 
@@ -18,8 +18,14 @@ function streamClaude(
 		throw new Error("pi-chameleon uses fetch injection, not a custom Anthropic client");
 	}
 	const request = prepareRelayRequest(CLAUDE_PROFILE, model, options);
+	// Select the native non-strict serializer rather than trying to undo its
+	// required/null schema transformation after it has already lost intent.
+	const wireModel = {
+		...request.model,
+		compat: { ...request.model.compat, ...CLAUDE_SERIALIZER_COMPAT },
+	};
 	const payload = claudePayloadAdapter(request.options.sessionId, options?.onPayload);
-	const events = delegate(request.model, context, { ...request.options, onPayload: payload.onPayload });
+	const events = delegate(wireModel, context, { ...request.options, onPayload: payload.onPayload });
 	return restoredStream(events, payload.fromWire);
 }
 

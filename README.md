@@ -206,13 +206,27 @@ pi -e . --list-models chameleon
 - 指纹固定为 `claude-cli/2.1.302 (external, cli)`，不追加 Pi UA；发送用户抓包顺序的 11 项 beta。
 - Stainless header 指纹固定为 Windows/x64/node v26.3.0、package 0.128.0、retry count 0、timeout 60000；这是 header 指纹，不代表真实运行环境。实际请求超时由 Pi 的 `timeoutMs` 决定，默认 600 秒。
 - `metadata.user_id.session_id` 与 `x-claude-code-session-id` 一致；device ID 为进程级随机值，trace ID 每次请求重新生成，不复用抓包标识。
-- system 保留两块：CLI 身份块，以及通用 Claude Code 模板 + 完整 Pi 运行指令。模板由 `src/claude/prompts.ts` 管理，仅替换开头的 Pi 身份，保留规则、工具说明、技能和真实环境；真实运行指令优先于通用 Harness 描述。
-- 不添加 billing 或 Agent SDK 身份；移除旧版独立前缀，但不改写项目文本中的引用。空提示和重复适配都不会叠加前缀。
-- 工具名双向映射：出站使用 Claude Code 风格，事件流和最终结果恢复 Pi 名称；工具 schema、参数和用户数据不变。
-- adaptive thinking 使用 Pi 当前 effort，`display: updates`；支持真实中途 system 更新的 per-turn effort，不强制 `max` 或覆盖显式输出上限。
+- 顶层 system 固定两块：Claude Code 身份，以及通用 core + 空的 `# Runtime instructions` 前缀；与用户提供的真实 Aether 出站样本逐字对拍，不添加 billing、合成 assistant 确认或虚构 token 余额。
+- 完整 Pi 运行指令放在 `messages[0].role=system`，保留实际工具说明、权限、项目规则、环境与原始空白；原有 user/assistant 历史随后接上，不把 system 降级为 user。只对本项目精确识别的旧模板做迁移。
+- 工具仍放在顶层 `tools`。原生序列化禁用 eager/strict/deferred 工具扩展，不再注入 `__pi_deferred_placeholder__`；可选参数仍可省略，不改成必填 nullable。显式要求 strict 的工具会报不支持，不能静默降低约束。
+- 每轮以当前真实工具集生成顶层 tools；新增/移除工具和后续 system 更新通过 Pi 原生会话转换处理。工具名称出站映射、回程还原，参数与用户数据不受影响。
+- 缓存断点仅位于两块顶层 system、最后一个真实工具和最后一条 user 的末内容块，最多 4 处；调用方 `onPayload` 后再次规范化。schema、工具参数和嵌套结果中的同名键是普通数据，不递归改写。
+- adaptive thinking 保留 `display: updates`；effort 仅在顶层发送，随 Pi 当前选择，不再添加空 per-turn effort 消息；不强制 `low`、`max` 或覆盖显式输出上限。
 - 不伪造 `/model` 历史、记忆、环境路径、技能清单、token 余额或 Claude 专属工具。
 
-协议转换、SSE、usage 和取消委托 Pi 原生 `anthropic-messages` 实现。历史受限实测两端均返回 429，不能证明已通过全部校验。
+当前对齐目标是用户提供的**实际 Aether 出站抓包**，不是固定 Rust 源码中另一个会添加 billing 和 user/assistant 前缀的分支。没有复制 Aether 源码、抓包中的个人目录、对话、凭据或工具清单；headers 仍沿用用户已核对的 2.1.302 指纹。
+
+协议转换、SSE、usage 和取消继续委托 Pi 原生 `anthropic-messages`。离线回归包含连续三轮真实历史传递，以及执行本地 `read` 后回传原始文件内容的工具链路。
+
+已授权的真实验证需要区分三种结果：
+
+| 驱动方式与任务 | 实际结果 |
+|---|---|
+| Pi SDK 同会话三轮对话 | 第一轮 200 并回答 `1+1 = 2`；第二轮 HTTP 200 但流中返回 `Cyber safeguards flagged this message`，停止，第三轮未发送 |
+| Pi SDK 读取并分析 `src/relay-transport.ts` | 两次 HTTP 200，实际读取和工具结果回传成功；210 秒测试总时限到达后主动取消，未收到最终分析 |
+| 真正 Pi CLI 以 `-e` 加载本项目插件执行文件分析 | 首轮返回 429 `Service Unavailable`，未触发 `Read`；只发起一次任务，无自动重试 |
+
+210 秒只是当次 SDK 测试的总时限，不是插件默认超时。HTTP 200 或 CLI 退出码 0 都不等于模型任务完成，应同时检查消息的 `stopReason`、工具结果和最终文本。以上结果不能证明完整上游兼容，不会通过换 key、改安全提示或重复请求绕过拦截。
 
 ## Codex 伪装
 

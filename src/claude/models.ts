@@ -1,5 +1,6 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import { CLAUDE_SERIALIZER_COMPAT } from "./identity.ts";
 type ChatModelConfig = Omit<Extract<ProviderModelConfig, { reasoning: boolean }>, "compat"> & {
 	compat?: Model<"anthropic-messages">["compat"];
 };
@@ -25,10 +26,7 @@ export const CLAUDE_MODELS: ChatModelConfig[] = [
 		compat: {
 			forceAdaptiveThinking: true,
 			supportsTemperature: false,
-			supportsMidConvoEffort: true,
-			supportsMidConvoSystemMessages: true,
-			supportsMidConvoToolChanges: true,
-			supportsStrictTools: true,
+			...CLAUDE_SERIALIZER_COMPAT,
 		},
 		thinkingLevelMap: {
 			off: null,
@@ -49,7 +47,7 @@ export const CLAUDE_MODELS: ChatModelConfig[] = [
 		cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
+		compat: { forceAdaptiveThinking: true, ...CLAUDE_SERIALIZER_COMPAT },
 		thinkingLevelMap: { max: "max" },
 	},
 	{
@@ -61,7 +59,7 @@ export const CLAUDE_MODELS: ChatModelConfig[] = [
 		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
+		compat: { forceAdaptiveThinking: true, ...CLAUDE_SERIALIZER_COMPAT },
 		thinkingLevelMap: { max: "max" },
 	},
 ];
