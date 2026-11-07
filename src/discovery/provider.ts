@@ -4,7 +4,7 @@ import {
 import { claudeCodeStream, claudeCodeStreamSimple } from "../claude/stream.ts";
 import { codexStream, codexStreamSimple } from "../codex/stream.ts";
 import { buildModels, CatalogFetchError, fetchCatalog } from "./catalog.ts";
-import type { CatalogSnapshot, ChameleonProviderId, DiscoveryAccess, DiscoveryClock, RelayFamily, SnapshotRepository, SnapshotState } from "./types.ts";
+import type { CatalogSnapshot, ChameleonProviderId, DiscoveryAccess, DiscoveryClock, RelayFamily, SnapshotRepository, SnapshotState, SnapshotToken } from "./types.ts";
 
 export interface DiscoveryState {
 	provider: ChameleonProviderId;
@@ -32,6 +32,7 @@ interface CatalogJob {
 	identity: string;
 	revision: number;
 	controller: AbortController;
+	token?: SnapshotToken;
 	result: Promise<CatalogSnapshot>;
 }
 
@@ -52,6 +53,8 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 	const now = () => deps.clock?.now() ?? Date.now();
 	const emit = (status: DiscoveryState["status"]) => deps.onChange?.({ provider: id, status, checkedAt: saved.snapshot?.checkedAt });
 	function cancelJob() { revision++; job?.controller.abort(); job = undefined; }
+	const jobCurrent = (candidate: CatalogJob) => !disposed && job === candidate && revision === candidate.revision
+		&& identity === candidate.identity && !candidate.controller.signal.aborted;
 	const base = createProvider({
 		id, name: family === "claude" ? "Chameleon Claude (Claude Code disguise)" : "Chameleon Codex (Codex CLI disguise)",
 		auth: { apiKey: envApiKeyAuth("Relay API key", []) }, models: [],
@@ -66,6 +69,7 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 			latest = context;
 			const current = () => !disposed && latest === context && !context.signal.aborted;
 			let ownedJob: CatalogJob | undefined;
+			let accessResolved = false;
 			try {
 				const resolved = await deps.resolveAccess();
 				if (!current()) return;
@@ -76,6 +80,7 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 				}
 				const access = canonicalAccess(resolved);
 				const nextIdentity = await deps.repository.identity(access);
+				accessResolved = true;
 				if (!current()) return;
 				if (identity !== nextIdentity) {
 					cancelJob();
@@ -95,31 +100,56 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 				if (context.force) cancelJob();
 				if (!job) {
 					const controller = new AbortController();
-					const result = fetchCatalog(family, access, { fetch: deps.fetch ?? globalThis.fetch, clock: deps.clock, signal: controller.signal })
-						.then((records) => ({ checkedAt: now(), records }));
-					job = { identity: nextIdentity, revision, controller, result };
+					const created: CatalogJob = {
+						identity: nextIdentity, revision, controller,
+						// Admit the shared job before IO. A new native waiter must not claim it twice.
+						result: Promise.resolve().then(async () => {
+							if (deps.repository.begin) created.token = await deps.repository.begin(id, created.identity, {
+								signal: controller.signal, isCurrent: () => jobCurrent(created),
+							});
+							if (!jobCurrent(created)) throw new CatalogFetchError("cancelled");
+							const records = await fetchCatalog(family, access, { fetch: deps.fetch ?? globalThis.fetch, clock: deps.clock, signal: controller.signal });
+							return { checkedAt: now(), records };
+						}),
+					};
+					job = created;
 				}
 				ownedJob = job;
-				const active = () => current() && job === ownedJob && revision === ownedJob!.revision && identity === ownedJob!.identity && !ownedJob!.controller.signal.aborted;
+				const active = () => current() && jobCurrent(ownedJob!);
 				emit("loading");
 				const snapshot = await ownedJob.result;
 				if (!active()) return;
 				if (!await context.publish({ update: () => { saved = { snapshot, suspended: false }; models = buildModels(family, access.baseUrl, snapshot.records); unsaved = true; } }) || !active()) return;
 				try {
-					await deps.repository.saveSuccess(id, nextIdentity, snapshot, { signal: ownedJob.controller.signal, isCurrent: active });
+					await deps.repository.saveSuccess(id, ownedJob.identity, snapshot, { token: ownedJob.token, signal: ownedJob.controller.signal, isCurrent: active });
 					if (active()) { unsaved = false; emit(snapshot.records.length ? "success" : "empty"); }
 				} catch {
 					if (active()) emit("unsaved");
 				}
 			} catch (error) {
 				if (!current() || (ownedJob && (job !== ownedJob || revision !== ownedJob.revision))) return;
+				if (!accessResolved) {
+					cancelJob();
+					if (await context.publish({ update: () => { identity = undefined; saved = { suspended: false }; models = []; unsaved = false; } }) && current()) emit("unconfigured");
+					return;
+				}
 				if (error instanceof CatalogFetchError && (error.httpStatus === 401 || error.httpStatus === 403)) {
 					if (!await context.publish({ update: () => { saved = { ...saved, suspended: true }; models = []; } }) || !current()) return;
 					let status: DiscoveryState["status"] = "suspended";
-					try { if (identity) await deps.repository.suspend(id, identity, { signal: context.signal, isCurrent: current }); }
+					try { if (ownedJob) await deps.repository.suspend(id, ownedJob.identity, {
+						token: ownedJob.token, signal: ownedJob.controller.signal, isCurrent: () => current() && jobCurrent(ownedJob!),
+					}); }
 					catch { status = "suspension-unsaved"; }
 					if (current()) emit(status);
-				} else emit("failed");
+					} else {
+					if (ownedJob?.token && deps.repository.release && jobCurrent(ownedJob)
+						&& !(error instanceof CatalogFetchError && error.code === "cancelled")) {
+						try { await deps.repository.release(id, ownedJob.identity, {
+							token: ownedJob.token, signal: ownedJob.controller.signal, isCurrent: () => current() && jobCurrent(ownedJob!),
+						}); } catch { /* The durable barrier stays closed if release fails. */ }
+					}
+					if (current()) emit("failed");
+				}
 			} finally {
 				// A superseded waiter cannot release a job the latest waiter is about to join.
 				if (ownedJob && job === ownedJob && (current() || !latest || latest.signal.aborted)) job = undefined;
