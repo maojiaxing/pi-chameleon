@@ -42,6 +42,23 @@ test("success replaces the one catalog, suspension preserves it, and an empty su
 	});
 });
 
+test("suspending a different identity preserves only the prior identity's successful catalog", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const previous = await repository.identity(access);
+		const denied = await repository.identity({ ...access, apiKey: "SYNTHETIC_DENIED_IDENTITY" });
+		await repository.saveSuccess(claude, previous, first);
+		await repository.suspend(claude, denied);
+		const restarted = createSnapshotRepository({ directory });
+		assert.deepEqual(await restarted.read(claude, denied), { suspended: true });
+		assert.deepEqual(await restarted.read(claude, previous), { snapshot: first, suspended: false });
+		const empty: CatalogSnapshot = { checkedAt: first.checkedAt + 1, records: [] };
+		await repository.saveSuccess(claude, denied, empty);
+		assert.deepEqual(await restarted.read(claude, previous), { suspended: false }, "a real success replaces the single successful identity");
+		assert.deepEqual(await restarted.read(claude, denied), { snapshot: empty, suspended: false });
+	});
+});
+
 test("serialized bytes contain only validated discovery facts, not runtime objects or synthetic secrets", async () => {
 	await withDirectory(async (directory) => {
 		const secret = "SYNTHETIC_RAW_AND_OVERRIDE_SECRET";

@@ -94,7 +94,10 @@ function checkGuard(guard?: OperationGuard): void {
 interface Envelope extends SnapshotState {
 	schemaVersion: 1;
 	provider: ChameleonProviderId;
+	/** Active identity metadata and the single successful identity are distinct records. */
 	identity: string;
+	snapshotIdentity?: string;
+	snapshotSuspended?: boolean;
 }
 
 const MAX_BYTES = 1024 * 1024;
@@ -243,23 +246,38 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 			throw new SnapshotRepositoryError("SNAPSHOT_IDENTITY_FAILED");
 		}
 	}
+	async function load(provider: ChameleonProviderId, guard?: OperationGuard): Promise<Envelope | undefined> {
+		try {
+			const value: unknown = JSON.parse(Buffer.from(await io.readFile(file(provider), MAX_BYTES)).toString("utf8"));
+			checkGuard(guard);
+			if (!object(value) || value.schemaVersion !== 1 || value.provider !== provider || !validIdentity(value.identity)
+				|| typeof value.suspended !== "boolean") return;
+			const envelope: Envelope = { schemaVersion: 1, provider, identity: value.identity, suspended: value.suspended };
+			if (value.snapshot !== undefined) {
+				const snapshot = catalogSnapshot(value.snapshot);
+				if (!snapshot || (value.snapshotIdentity !== undefined && !validIdentity(value.snapshotIdentity))
+					|| (value.snapshotSuspended !== undefined && typeof value.snapshotSuspended !== "boolean")) return;
+				envelope.snapshot = snapshot;
+				envelope.snapshotIdentity = value.snapshotIdentity ?? value.identity;
+				envelope.snapshotSuspended = value.snapshotSuspended ?? value.suspended;
+			}
+			return envelope;
+		} catch (error) {
+			if (error instanceof SnapshotRepositoryError) throw error;
+			return;
+		}
+	}
 	async function read(provider: ChameleonProviderId, digest: string, guard?: OperationGuard): Promise<SnapshotState> {
 		checkGuard(guard);
 		if (!validProvider(provider) || !validIdentity(digest)) return { suspended: false };
-		try {
-			const envelope: unknown = JSON.parse(Buffer.from(await io.readFile(file(provider), MAX_BYTES)).toString("utf8"));
-			checkGuard(guard);
-			if (!object(envelope) || envelope.schemaVersion !== 1 || envelope.provider !== provider || envelope.identity !== digest
-				|| typeof envelope.suspended !== "boolean") return { suspended: false };
-			if (envelope.snapshot === undefined) return { suspended: envelope.suspended };
-			const snapshot = catalogSnapshot(envelope.snapshot);
-			return snapshot ? { snapshot, suspended: envelope.suspended } : { suspended: false };
-		} catch (error) {
-			if (error instanceof SnapshotRepositoryError) throw error;
-			return { suspended: false };
+		const envelope = await load(provider, guard);
+		if (!envelope) return { suspended: false };
+		if (envelope.snapshotIdentity === digest && envelope.snapshot) {
+			return { snapshot: envelope.snapshot, suspended: envelope.snapshotSuspended ?? false };
 		}
+		return { suspended: envelope.identity === digest && envelope.suspended };
 	}
-	async function commit(provider: ChameleonProviderId, digest: string, state: SnapshotState, guard?: OperationGuard) {
+	async function commit(provider: ChameleonProviderId, digest: string, state: SnapshotState & Pick<Envelope, "snapshotIdentity" | "snapshotSuspended">, guard?: OperationGuard) {
 		checkGuard(guard);
 		if (!validProvider(provider) || !validIdentity(digest)) throw new SnapshotRepositoryError("SNAPSHOT_INVALID");
 		const path = file(provider);
@@ -294,14 +312,22 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 				throw new SnapshotRepositoryError("SNAPSHOT_INVALID");
 			}
 			if (!safe || !validProvider(provider) || !validIdentity(digest)) throw new SnapshotRepositoryError("SNAPSHOT_INVALID");
-			await serializeWrite(file(provider), () => commit(provider, digest, { snapshot: safe, suspended: false }, guard));
+			await serializeWrite(file(provider), () => commit(provider, digest, {
+				snapshot: safe, snapshotIdentity: digest, snapshotSuspended: false, suspended: false,
+			}, guard));
 		},
 		suspend: async (provider, digest, guard) => {
 			checkGuard(guard);
 			if (!validProvider(provider) || !validIdentity(digest)) throw new SnapshotRepositoryError("SNAPSHOT_INVALID");
 			await serializeWrite(file(provider), async () => {
-				const state = await read(provider, digest, guard);
-				await commit(provider, digest, { ...state, suspended: true }, guard);
+				const state = await load(provider, guard);
+				await commit(provider, digest, {
+					suspended: true,
+					...(state?.snapshot ? {
+						snapshot: state.snapshot, snapshotIdentity: state.snapshotIdentity,
+						snapshotSuspended: state.snapshotIdentity === digest || state.snapshotSuspended,
+					} : {}),
+				}, guard);
 			});
 		},
 	};
