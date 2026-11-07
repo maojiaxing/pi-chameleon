@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type FetchFunction, type Model } from "@earendil-works/pi-ai";
 import {
 	createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager,
-	type AgentSession, type ExtensionAPI, type ExtensionUIContext,
+	type AgentSession, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { createChameleonExtension } from "../src/index.ts";
 import { createSnapshotRepository } from "../src/discovery/snapshot.ts";
@@ -51,8 +51,10 @@ const explicit: Model<Api> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 async function withSession(fetch: FetchFunction, run: (h: {
-	session: AgentSession; registry: ModelRegistry; notifications: string[]; pi: ExtensionAPI; loader: DefaultResourceLoader;
-}) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0] } = {}) {
+	session: AgentSession; registry: ModelRegistry; runtime: ModelRuntime; notifications: string[]; pi: ExtensionAPI;
+	loader: DefaultResourceLoader; contexts: ExtensionContext[]; startReasons: string[];
+}) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0]; noModel?: boolean;
+	providerExtras?: Partial<Record<"chameleon-codex" | "chameleon-claude", Record<string, unknown>>> } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-lifecycle-"));
 	let session: AgentSession | undefined;
 	try {
@@ -61,16 +63,22 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		const path = join(agentDir, "models.json");
 		await writeFile(path, JSON.stringify({ providers: {
 			"chameleon-codex": { baseUrl: "https://relay.example.test/v1", apiKey: "synthetic-session-key", authHeader: true,
-				models: [{ ...explicit, baseUrl: undefined, provider: undefined }] },
-			"chameleon-claude": { baseUrl: "https://relay.example.test", apiKey: "synthetic-session-key" },
+				models: options.noModel ? [] : [{ ...explicit, baseUrl: undefined, provider: undefined }],
+				...(options.providerExtras?.["chameleon-codex"] ?? {}) },
+			"chameleon-claude": { baseUrl: "https://relay.example.test", apiKey: "synthetic-session-key",
+				...(options.providerExtras?.["chameleon-claude"] ?? {}) },
 		} }));
 		const runtime = await ModelRuntime.create({
 			credentials: new InMemoryCredentialStore(), modelsPath: path, modelsStore: new InMemoryModelsStore(),
 			refreshOnCreate: false, allowModelNetwork: false,
 		});
-		const settings = SettingsManager.inMemory(options.settings ?? { defaultProvider: "chameleon-codex", defaultModel: "explicit-session" });
+		const settings = SettingsManager.inMemory(options.settings ?? (options.noModel
+			? { defaultProvider: "chameleon-codex", defaultModel: "missing-first-start-default" }
+			: { defaultProvider: "chameleon-codex", defaultModel: "explicit-session" }));
 		const registry = new ModelRegistry(runtime);
 		let pi!: ExtensionAPI;
+		const contexts: ExtensionContext[] = [];
+		const startReasons: string[] = [];
 		const startupRequests = new Set<string>();
 		const startupArmed = deferred<void>();
 		const observedFetch: FetchFunction = (input, init) => {
@@ -83,13 +91,17 @@ async function withSession(fetch: FetchFunction, run: (h: {
 			noPromptTemplates: true, noContextFiles: true,
 			extensionFactories: [{ name: "chameleon-test", factory: createChameleonExtension({
 				fetch: observedFetch, repository: createSnapshotRepository({ directory: join(directory, "catalogs") }),
-			}) }, { name: "public-test-observer", factory(api) { pi = api; } }],
+			}) }, { name: "public-test-observer", factory(api) {
+				pi = api;
+				api.on("session_start", (event, context) => { contexts.push(context); startReasons.push(event.reason); });
+			} }],
 		});
 		await loader.reload();
 		assert.deepEqual(loader.getExtensions().errors, []);
 		const created = await createAgentSession({
 			cwd: directory, agentDir, modelRuntime: runtime, resourceLoader: loader,
-			settingsManager: settings, sessionManager: SessionManager.inMemory(directory), model: explicit, noTools: "all",
+			settingsManager: settings, sessionManager: SessionManager.inMemory(directory),
+			...(options.noModel ? {} : { model: explicit }), noTools: "all",
 		});
 		session = created.session;
 		// Native registration queues cache-only refreshes. Let them enter, then await the public initialization barrier.
@@ -100,7 +112,7 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		await session.bindExtensions({ uiContext: { notify(message) { notifications.push(message); } } as ExtensionUIContext, mode: "print" });
 		// Wait for external startup GETs to be armed, not completed, before a test starts an ordinary host refresh.
 		if (process.env.PI_OFFLINE === undefined) await startupArmed.promise;
-		await run({ session, registry, notifications, pi, loader });
+		await run({ session, registry, runtime, notifications, get pi() { return pi; }, loader, contexts, startReasons });
 	} finally {
 		if (session) {
 			await session.abort();
@@ -136,6 +148,140 @@ test("the real InlineExtension loader starts background discovery through public
 		assert.equal(requests[0].headers.get("authorization") ?? requests[1].headers.get("authorization"), "Bearer synthetic-session-key");
 		assert.ok(notifications.some((n) => n.includes("加载")));
 	});
+});
+
+test("public session.reload cancels the old epoch, restores cache before startup GETs, and preserves selection and defaults", { timeout: 40_000 }, async () => {
+	let phase: "old-pending" | "reloaded" | "cached-reload" = "old-pending";
+	const oldStarted = deferred<void>();
+	const reloadStarted = deferred<void>();
+	const cachedReloadStarted = deferred<void>();
+	const oldResponses = { codex: deferred<Response>(), claude: deferred<Response>() };
+	const reloadResponses = { codex: deferred<Response>(), claude: deferred<Response>() };
+	const cachedReloadResponses = { codex: deferred<Response>(), claude: deferred<Response>() };
+	const requests: { phase: string; family: "codex" | "claude"; signal: AbortSignal }[] = [];
+	let hRef: { registry: ModelRegistry } | undefined;
+	const fetch: FetchFunction = async (_url, init) => {
+		const family = new Headers(init?.headers).has("authorization") ? "codex" : "claude";
+		assert.ok(init?.signal);
+		requests.push({ phase, family, signal: init.signal });
+		if (phase === "old-pending") {
+			if (requests.filter((r) => r.phase === phase).length === 2) oldStarted.resolve();
+			return oldResponses[family].promise; // Deliberately ignores cancellation: a late GET must remain fenced.
+		}
+		if (phase === "cached-reload") {
+			if (requests.filter((r) => r.phase === phase).length === 1) {
+				// The first startup GET after reload must already see the restored cache snapshot.
+				assert.ok(hRef!.registry.find("chameleon-codex", "gpt-reload-new"), "restored cache must be visible before the first startup GET after reload");
+				assert.ok(hRef!.registry.find("chameleon-claude", "claude-reload-new"));
+			}
+			if (requests.filter((r) => r.phase === phase).length === 2) cachedReloadStarted.resolve();
+			return cachedReloadResponses[family].promise;
+		}
+		if (requests.filter((r) => r.phase === phase).length === 2) reloadStarted.resolve();
+		return reloadResponses[family].promise;
+	};
+	await withSession(fetch, async (h) => {
+		hRef = h;
+		const defaults = h.pi.getSettings();
+		const oldContext = h.contexts[0];
+		await oldStarted.promise;
+		const oldRefresh = h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		const oldRequests = requests.filter((r) => r.phase === "old-pending");
+		phase = "reloaded";
+		await h.session.reload({ beforeSessionStart: async () => {
+			// Reload queues native provider registration just like first initialization.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await h.runtime.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: false });
+			assert.equal(h.registry.find("chameleon-codex", "gpt-reload-new"), undefined);
+			assert.equal(requests.filter((r) => r.phase === "reloaded").length, 0, "cache initialization must not start GETs");
+		} });
+		await reloadStarted.promise;
+		assert.deepEqual(h.startReasons, ["startup", "reload"]);
+		assert.notEqual(h.contexts[1], oldContext);
+		assert.ok(oldRequests.every((r) => r.signal.aborted), "old discovery must be cancelled on real reload");
+		assert.equal(h.session.model?.id, "explicit-session");
+		reloadResponses.codex.resolve(Response.json({ data: [{ id: "gpt-reload-new" }] }));
+		reloadResponses.claude.resolve(Response.json({ data: [{ id: "claude-reload-new" }], has_more: false }));
+		await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		oldResponses.codex.resolve(Response.json({ data: [{ id: "gpt-obsolete-epoch" }] }));
+		oldResponses.claude.resolve(Response.json({ data: [{ id: "claude-obsolete-epoch" }], has_more: false }));
+		await oldRefresh;
+		assert.ok(h.registry.find("chameleon-codex", "gpt-reload-new"));
+		assert.ok(h.registry.find("chameleon-claude", "claude-reload-new"));
+		assert.equal(h.registry.find("chameleon-codex", "gpt-obsolete-epoch"), undefined);
+		assert.equal(h.registry.find("chameleon-claude", "claude-obsolete-epoch"), undefined);
+		assert.equal(h.session.model?.id, "explicit-session", "reload must not silently choose a newly discovered ID");
+		assert.deepEqual(h.pi.getSettings(), defaults);
+		await h.pi.setModel(h.registry.find("chameleon-codex", "gpt-reload-new")!);
+		phase = "cached-reload";
+		await h.session.reload({ beforeSessionStart: async () => {
+			// No GET may start before session_start; the pending cache restore itself must stay offline.
+			assert.equal(requests.filter((r) => r.phase === "cached-reload").length, 0);
+		} });
+		await cachedReloadStarted.promise;
+		assert.equal(h.session.model?.id, "gpt-reload-new");
+		cachedReloadResponses.codex.resolve(Response.json({ data: [{ id: "gpt-after-cached-reload" }] }));
+		cachedReloadResponses.claude.resolve(Response.json({ data: [{ id: "claude-after-cached-reload" }], has_more: false }));
+		await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		assert.deepEqual(h.startReasons, ["startup", "reload", "reload"]);
+		assert.ok(h.registry.find("chameleon-codex", "gpt-after-cached-reload"));
+		assert.equal(h.session.model?.id, "gpt-reload-new", "a removed selected ID remains the user's selection");
+		assert.deepEqual(h.pi.getSettings(), defaults);
+		assert.ok(h.notifications.some((n) => n.includes("保留当前会话选择")));
+	});
+});
+
+test("a first start without cache, explicit model, or a discovered default does not auto-select and guides the user", { timeout: 40_000 }, async () => {
+	const savedEnv = { ...process.env };
+	// Isolate ambient shell credentials so no built-in provider can satisfy SDK initial selection.
+	for (const key of Object.keys(process.env))
+		if (/(ANTHROPIC|OPENAI|GOOGLE|GEMINI|XAI|GROQ|MISTRAL|OPENROUTER|DEEPSEEK|AZURE|CLAUDE|CODEX).*(KEY|TOKEN)/i.test(key)) delete process.env[key];
+	try {
+		const responses = { codex: deferred<Response>(), claude: deferred<Response>() };
+		const started = deferred<void>();
+		let startedCount = 0;
+		const fetch: FetchFunction = async (_url, init) => {
+			if (++startedCount === 2) started.resolve();
+			return new Headers(init?.headers).has("authorization") ? responses.codex.promise : responses.claude.promise;
+		};
+		await withSession(fetch, async (h) => {
+			await started.promise;
+			const placeholder = h.session.model!;
+			assert.ok(placeholder.id === "unknown" && placeholder.provider === "unknown",
+				`SDK initial selection must stay on the unknown placeholder without cache, explicit model, or ambient credentials: ${placeholder.provider}/${placeholder.id}`);
+			assert.ok(h.notifications.some((n) => n.includes("正在后台加载")), "loading guidance must be visible");
+			assert.equal(h.registry.find("chameleon-codex", "gpt-first-start"), undefined, "nothing is public before discovery completes");
+			const settings = h.pi.getSettings();
+			responses.codex.resolve(Response.json({ data: [{ id: "gpt-first-start" }] }));
+			responses.claude.resolve(Response.json({ data: [{ id: "claude-first-start" }], has_more: false }));
+			await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+			assert.ok(h.registry.find("chameleon-codex", "gpt-first-start"));
+			assert.ok(h.registry.find("chameleon-claude", "claude-first-start"));
+			assert.deepEqual([h.session.model?.provider, h.session.model?.id], ["unknown", "unknown"],
+				"discovery completion must not auto-select a Chameleon model");
+			assert.ok(h.notifications.some((n) => n.includes("默认模型尚未发现") && n.includes("未修改")), "default-model guidance must be visible");
+			await h.pi.setModel(h.registry.find("chameleon-codex", "gpt-first-start")!);
+			assert.equal(h.session.model?.id, "gpt-first-start");
+			assert.deepEqual(h.pi.getSettings(), settings);
+		}, { noModel: true });
+	} finally {
+		process.env = savedEnv;
+	}
+});
+
+test("a user rename via modelOverrides keeps the user's name and still explains that cost is not a relay bill", { timeout: 20_000 }, async () => {
+	const fetch: FetchFunction = async (_url, init) => Response.json(new Headers(init?.headers).has("authorization")
+		? { data: [{ id: "gpt-5.3-codex" }] } : { data: [], has_more: false });
+	await withSession(fetch, async (h) => {
+		await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		const renamed = h.registry.find("chameleon-codex", "gpt-5.3-codex")!;
+		assert.equal(renamed.name, "我的常用模型", "the user's rename must be preserved, not reverted");
+		const before = h.notifications.length;
+		await h.pi.setModel(renamed);
+		const note = h.notifications.slice(before).join(" ");
+		assert.ok(!note.includes("来自本地官方资料"), "a renamed model must not be presented as official reference pricing");
+		assert.ok(note.includes("不是中转站账单"), "a source-of-cost warning must survive the rename");
+	}, { providerExtras: { "chameleon-codex": { modelOverrides: { "gpt-5.3-codex": { name: "我的常用模型" } } } } });
 });
 
 test("the real session command force-refreshes the requested provider or both and safely reports results without changing defaults", { timeout: 20_000 }, async () => {
@@ -259,5 +405,3 @@ test("busy same-ID changes wait for a real agent_settled event and removed or su
 		assert.equal(session.model?.contextWindow, 12_000);
 	});
 });
-
-

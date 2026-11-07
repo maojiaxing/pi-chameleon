@@ -379,6 +379,23 @@ test("safe adapter facts preserve zero rates and partial cost gaps, while Pi use
 	}, { records });
 });
 
+test("effective API context limits bound both referenced and API output budgets", () => {
+	const models = buildModels("codex", codexConfig.baseUrl, [
+		{ id: "gpt-5", contextWindow: 8_192 },
+		{ id: "gpt-5.4", contextWindow: 2_048, maxTokens: 4_096 },
+	]);
+	assert.deepEqual(models.map(({ contextWindow, maxTokens }) => [contextWindow, maxTokens]), [[8_192, 8_192], [2_048, 2_048]]);
+});
+
+test("API thinking fields override exact references individually, including explicit null", () => {
+	const [model] = buildModels("codex", codexConfig.baseUrl, [{
+		id: "gpt-5.4", thinkingLevelMap: { high: "medium", xhigh: null },
+	}]);
+	assert.equal(model.thinkingLevelMap?.high, "medium");
+	assert.equal(model.thinkingLevelMap?.xhigh, null);
+	assert.equal(model.thinkingLevelMap?.off, "none", "unspecified fields still use the exact reference");
+});
+
 test("unsafe destinations and missing credentials fail before GET without revealing configuration secrets", async () => {
 	for (const baseUrl of [
 		"not-a-url-SYNTHETIC_SECRET", "file:///SYNTHETIC_SECRET", "ftp://relay.example.test/SYNTHETIC_SECRET",

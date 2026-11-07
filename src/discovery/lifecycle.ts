@@ -147,8 +147,10 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 			if (!families.some((family) => event.model.provider === `chameleon-${family}`)) return;
 			const details = ["Chameleon：所选模型是协议候选，不代表聊天已验证。"];
 			if (event.model.name.includes("能力未确认")) details.push("能力未确认，临时客户端预算不代表上游实际限额；可通过 Pi 原生覆盖补正。");
+			// Cost provenance must survive user renames: markers can be lost in modelOverrides, so fall back to a generic warning.
 			if (event.model.name.includes("参考费用")) details.push("参考费用来自本地官方资料，仅为估算，不是中转站账单。");
-			if (event.model.name.includes("费用未知")) details.push("费用未知，原生统计的零占位不代表免费。");
+			else if (event.model.name.includes("费用未知")) details.push("费用未知，原生统计的零占位不代表免费。");
+			else details.push("费用来源未确认：本地资料仅为估算或未知，不是中转站账单。");
 			context.ui.notify(details.join(" "), "info");
 		});
 		pi.on("session_start", (_event, context) => {
