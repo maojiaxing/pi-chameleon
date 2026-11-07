@@ -31,12 +31,15 @@ test("real pi 1.5.0 loader registers native CLI adapters from models.json with n
 		));
 		await writeFile(join(config, "models.json"), JSON.stringify({
 			providers: {
-				"chameleon-claude": { baseUrl: "https://relay.example.com", apiKey: "offline-fixture-key" },
-				"chameleon-codex": { baseUrl: "https://relay.example.com/v1", apiKey: "offline-fixture-key" },
+				"chameleon-claude": { baseUrl: "https://relay.example.com", apiKey: "offline-fixture-key",
+					models: [{ id: "relay-custom-claude", api: "anthropic-messages", name: "Explicit Claude fixture", reasoning: false }] },
+				"chameleon-codex": { baseUrl: "https://relay.example.com/v1", apiKey: "offline-fixture-key",
+					models: [{ id: "relay-custom-codex", api: "openai-responses", name: "Explicit Codex fixture", reasoning: false }] },
 			},
 		}));
 		Object.assign(env, {
 			PI_CODING_AGENT_DIR: config,
+			PI_OFFLINE: "",
 			NO_COLOR: "1",
 		});
 		const { stdout, stderr } = await exec(process.execPath, [
@@ -44,12 +47,10 @@ test("real pi 1.5.0 loader registers native CLI adapters from models.json with n
 			"--no-extensions", "--no-mcp", "--no-skills", "--no-session",
 			"-e", project, "--list-models",
 		], { cwd: workspace, env, timeout: 45_000 });
-		assert.match(stdout, /chameleon-claude\s+claude-opus-5-5/);
-		assert.match(stdout, /chameleon-claude\s+claude-opus-4-6/);
-		assert.match(stdout, /chameleon-claude\s+claude-sonnet-4-6/);
-		assert.match(stdout, /chameleon-codex\s+gpt-5\.3-codex/);
-		assert.match(stdout, /chameleon-codex\s+gpt-5\.4/);
-		assert.match(stdout, /chameleon-codex\s+gpt-5\.5/);
+		assert.match(stdout, /chameleon-claude\s+relay-custom-claude/);
+		assert.match(stdout, /chameleon-codex\s+relay-custom-codex/);
+		assert.doesNotMatch(stdout, /chameleon-claude\s+claude-(?:opus|sonnet)-/);
+		assert.doesNotMatch(stdout, /chameleon-codex\s+gpt-5\./);
 		assert.doesNotMatch(stderr, /Failed to load|Cannot find module|Error:/);
 	} finally {
 		await rm(temp, { recursive: true, force: true });

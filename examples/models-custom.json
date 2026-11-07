@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "chameleon-codex": {
+      "baseUrl": "https://relay.example.com/v1",
+      "apiKey": "replace-with-your-relay-api-key",
+      "models": [
+        {
+          "id": "private-codex-alias",
+          "name": "Private alias (synthetic example)",
+          "api": "openai-responses",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 1,
+            "output": 2,
+            "cacheRead": 0.1,
+            "cacheWrite": 1.25
+          }
+        }
+      ]
+    }
+  }
+}
