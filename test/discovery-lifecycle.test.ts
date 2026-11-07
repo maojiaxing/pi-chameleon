@@ -259,5 +259,3 @@ test("busy same-ID changes wait for a real agent_settled event and removed or su
 		assert.equal(session.model?.contextWindow, 12_000);
 	});
 });
-
-

@@ -4,6 +4,7 @@ import {
 import { claudeCodeStream, claudeCodeStreamSimple } from "../claude/stream.ts";
 import { codexStream, codexStreamSimple } from "../codex/stream.ts";
 import { buildModels, CatalogFetchError, fetchCatalog } from "./catalog.ts";
+import { installChameleonRouting } from "./routing.ts";
 import type { CatalogSnapshot, ChameleonProviderId, DiscoveryAccess, DiscoveryClock, RelayFamily, SnapshotRepository, SnapshotState, SnapshotToken } from "./types.ts";
 
 export interface DiscoveryState {
@@ -41,6 +42,7 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 	provider: Provider;
 	dispose(): void;
 } {
+	installChameleonRouting();
 	const id: ChameleonProviderId = `chameleon-${family}`;
 	let models: readonly Model<Api>[] = [];
 	let identity: string | undefined;
