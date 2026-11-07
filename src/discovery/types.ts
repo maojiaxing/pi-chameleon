@@ -33,14 +33,22 @@ export interface SnapshotState {
 	suspended: boolean;
 }
 
+/** Opaque durable provider revision. A token is useful only for its original identity/job. */
+export type SnapshotToken = string;
+
 export interface OperationGuard {
 	signal?: AbortSignal;
 	isCurrent?: () => boolean;
+	token?: SnapshotToken;
 }
 
 /** This dependency is the storage seam; implementations must never persist DiscoveryAccess. */
 export interface SnapshotRepository {
 	identity(access: DiscoveryAccess): Promise<string>;
+	/** Claim before starting network verification. Its durable pending barrier survives restarts. */
+	begin?(provider: ChameleonProviderId, identity: string, guard?: OperationGuard): Promise<SnapshotToken>;
+	/** End an ordinary failed check without clearing a known permission suspension. Requires its token. */
+	release?(provider: ChameleonProviderId, identity: string, guard: OperationGuard): Promise<void>;
 	read(provider: ChameleonProviderId, identity: string, guard?: OperationGuard): Promise<SnapshotState>;
 	saveSuccess(provider: ChameleonProviderId, identity: string, snapshot: CatalogSnapshot, guard?: OperationGuard): Promise<void>;
 	suspend(provider: ChameleonProviderId, identity: string, guard?: OperationGuard): Promise<void>;

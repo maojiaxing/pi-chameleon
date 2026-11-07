@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { fork, type ChildProcess } from "node:child_process";
 import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,6 +57,273 @@ test("suspending a different identity preserves only the prior identity's succes
 		await repository.saveSuccess(claude, denied, empty);
 		assert.deepEqual(await restarted.read(claude, previous), { suspended: false }, "a real success replaces the single successful identity");
 		assert.deepEqual(await restarted.read(claude, denied), { snapshot: empty, suspended: false });
+	});
+});
+
+test("a durable verification claim blocks restart reuse until an ordinary failure releases it", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		assert.ok(repository.begin, "the public repository must admit jobs before network work");
+		assert.ok(repository.release, "ordinary failures can end only their own verification claim");
+		const token = await repository.begin(claude, identity);
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: true });
+		await repository.release(claude, identity, { token });
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: false });
+	});
+});
+
+test("successful claimed verification clears its barrier without resetting the durable revision", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		assert.ok(repository.begin);
+		const token = await repository.begin(claude, identity);
+		const replacement: CatalogSnapshot = { checkedAt: first.checkedAt + 20, records: [] };
+		await repository.saveSuccess(claude, identity, replacement, { token });
+		const restarted = createSnapshotRepository({ directory });
+		assert.deepEqual(await restarted.read(claude, identity), { snapshot: replacement, suspended: false });
+		assert.ok(restarted.begin);
+		const next = await restarted.begin(claude, identity);
+		assert.ok(BigInt(next.split(":")[0]) > BigInt(token.split(":")[0]), "success must not erase the fencing revision");
+	});
+});
+
+function startSnapshotProcess(script: string, directory: string, mode: "old" | "new" | "legacy", identity: string) {
+	let blocked!: (value: { token: string }) => void;
+	let finish!: (value: { token: string; save: string; suspend?: string; release?: string }) => void;
+	let rejectBlocked!: (error: Error) => void;
+	let rejectDone!: (error: Error) => void;
+	const ready = new Promise<{ token: string }>((resolve, reject) => { blocked = resolve; rejectBlocked = reject; });
+	const done = new Promise<{ token: string; save: string; suspend?: string; release?: string }>((resolve, reject) => { finish = resolve; rejectDone = reject; });
+	const env: NodeJS.ProcessEnv = {};
+	for (const name of ["SystemRoot", "WINDIR", "TEMP", "TMP"]) if (process.env[name]) env[name] = process.env[name];
+	const child: ChildProcess = fork(script, [directory, mode, identity], {
+		cwd: directory, env, execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"], windowsHide: true,
+	});
+	const closed = new Promise<void>((resolve) => { child.once("close", () => resolve()); });
+	let completed = false;
+	child.on("message", (message) => {
+		if (!message || typeof message !== "object" || !("event" in message)) return;
+		if (message.event === "blocked" && "token" in message && typeof message.token === "string") blocked({ token: message.token });
+		if (message.event === "done" && "token" in message && typeof message.token === "string" && "save" in message && typeof message.save === "string") {
+			completed = true;
+			finish({ token: message.token, save: message.save,
+				...("suspend" in message && typeof message.suspend === "string" ? { suspend: message.suspend } : {}),
+				...("release" in message && typeof message.release === "string" ? { release: message.release } : {}),
+			});
+		}
+	});
+	const failed = () => { if (!completed) { const error = new Error("SYNTHETIC_CHILD_FAILED"); rejectBlocked(error); rejectDone(error); } };
+	child.on("error", failed);
+	child.on("exit", failed);
+	// Both promises have rejection handlers even when a scenario uses only one of them.
+	void ready.catch(() => {});
+	void done.catch(() => {});
+	return { child, ready, done, closed };
+}
+
+async function verifyCrossProcessFence(directory: string, differentIdentity: boolean, legacy = false) {
+	const repository = createSnapshotRepository({ directory });
+	const oldIdentity = await repository.identity(access);
+	const newIdentity = differentIdentity ? await repository.identity({ ...access, apiKey: "SYNTHETIC_NEW_PROCESS_KEY" }) : oldIdentity;
+	await repository.saveSuccess(claude, oldIdentity, first);
+	const script = join(directory, "synthetic-fencing-job.mjs");
+	await writeFile(script, `
+		import { once } from "node:events";
+		import { writeFile } from "node:fs/promises";
+		import { createSnapshotRepository } from ${JSON.stringify(new URL("../src/discovery/snapshot.ts", import.meta.url).href)};
+		const [directory, mode, identity] = process.argv.slice(2);
+		const provider = "chameleon-claude";
+		let token, paused = false;
+		const repository = createSnapshotRepository({ directory, io: mode !== "new" ? {
+			writeFile: async (path, bytes, options) => {
+				await writeFile(path, bytes, options);
+				const value = JSON.parse(String(bytes));
+				if (!paused && value.pending === false && value.snapshot?.checkedAt === 1700000000001) {
+					paused = true;
+					token = value.token;
+					process.send({ event: "blocked", token });
+					await once(process, "message");
+				}
+			},
+		} : undefined });
+		try {
+			if (mode !== "legacy") token = await repository.begin(provider, identity);
+			let save = "saved", suspend, release;
+			try { await repository.saveSuccess(provider, identity, {
+				checkedAt: mode !== "new" ? 1700000000001 : 1700000000002,
+				records: [{ id: mode !== "new" ? "synthetic-old" : "synthetic-new" }],
+			}, mode === "legacy" ? undefined : { token }); } catch (error) { save = error.code; }
+			if (mode !== "new") {
+				suspend = "suspended";
+				try { await repository.suspend(provider, identity, { token }); } catch (error) { suspend = error.code; }
+				release = "released";
+				try { await repository.release(provider, identity, { token }); } catch (error) { release = error.code; }
+			}
+			process.send({ event: "done", token, save, suspend, release });
+		} finally { process.disconnect(); }
+	`);
+	const old = startSnapshotProcess(script, directory, legacy ? "legacy" : "old", oldIdentity);
+	let next: ReturnType<typeof startSnapshotProcess> | undefined;
+	try {
+		const token1 = (await old.ready).token;
+		next = startSnapshotProcess(script, directory, "new", newIdentity);
+		const latest = await next.done;
+		assert.equal(latest.save, "saved");
+		assert.ok(BigInt(latest.token.split(":")[0]) > BigInt(token1.split(":")[0]));
+		const expected = { snapshot: { checkedAt: first.checkedAt + 2, records: [{ id: "synthetic-new" }] }, suspended: false };
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, newIdentity), expected);
+		old.child.send("resume");
+		const stale = await old.done;
+		assert.deepEqual([stale.save, stale.suspend, stale.release], ["SNAPSHOT_CANCELLED", "SNAPSHOT_CANCELLED", "SNAPSHOT_CANCELLED"]);
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, newIdentity), expected);
+		if (differentIdentity) assert.deepEqual(await repository.read(claude, oldIdentity), { suspended: false });
+	} finally {
+		if (old.child.exitCode === null) old.child.kill();
+		if (next && next.child.exitCode === null) next.child.kill();
+		await Promise.all([old.closed, next?.closed]);
+		await rm(script, { force: true });
+	}
+}
+
+for (const differentIdentity of [false, true]) {
+	test(`cross-process claims fence a late save, suspension and release for ${differentIdentity ? "different identities" : "the same identity"}`, { timeout: 20_000 }, async () => {
+		await withDirectory((directory) => verifyCrossProcessFence(directory, differentIdentity));
+	});
+}
+
+test("a legacy save claims before slow IO and cannot overtake a later process claim", { timeout: 20_000 }, async () => {
+	await withDirectory((directory) => verifyCrossProcessFence(directory, true, true));
+});
+
+test("a failed permission-suspension commit stays blocked across restart and a later ordinary failure", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		assert.ok(repository.begin);
+		const token = await repository.begin(claude, identity);
+		const faulty = createSnapshotRepository({ directory, io: {
+			rename: async () => { throw new Error("SYNTHETIC_401_COMMIT_SECRET"); },
+		} });
+		await assert.rejects(faulty.suspend(claude, identity, { token }), { code: "SNAPSHOT_WRITE_FAILED", message: "SNAPSHOT_WRITE_FAILED" });
+		const restarted = createSnapshotRepository({ directory });
+		assert.deepEqual(await restarted.read(claude, identity), { snapshot: first, suspended: true });
+		assert.ok(restarted.begin);
+		assert.ok(restarted.release);
+		const retry = await restarted.begin(claude, identity);
+		await restarted.release(claude, identity, { token: retry });
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: true },
+			"an unresolved earlier permission check requires a complete success, not an ordinary failure, to unblock");
+		const success = await restarted.begin(claude, identity);
+		const empty: CatalogSnapshot = { checkedAt: first.checkedAt + 30, records: [] };
+		await restarted.saveSuccess(claude, identity, empty, { token: success });
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: empty, suspended: false });
+	});
+});
+
+test("a failed claimed save preserves success behind its pending barrier until ordinary failure release", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		assert.ok(repository.begin);
+		assert.ok(repository.release);
+		const token = await repository.begin(claude, identity);
+		const faulty = createSnapshotRepository({ directory, io: {
+			writeFile: async (path, bytes, options) => {
+				await writeFile(path, String(bytes).slice(0, 12), options);
+				throw new Error("SYNTHETIC_PARTIAL_SAVE_SECRET");
+			},
+		} });
+		await assert.rejects(faulty.saveSuccess(claude, identity, { checkedAt: first.checkedAt + 40, records: [] }, { token }), {
+			code: "SNAPSHOT_WRITE_FAILED", message: "SNAPSHOT_WRITE_FAILED",
+		});
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: true });
+		await repository.release(claude, identity, { token });
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: false });
+	});
+});
+
+test("release of an ordinary failure never clears a known permission suspension", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		await repository.suspend(claude, identity);
+		assert.ok(repository.begin);
+		assert.ok(repository.release);
+		const token = await repository.begin(claude, identity);
+		await repository.release(claude, identity, { token });
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: true });
+	});
+});
+
+test("a claimed suspension for a new identity keeps the prior successful identity record", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const previous = await repository.identity(access);
+		const denied = await repository.identity({ ...access, apiKey: "SYNTHETIC_CLAIMED_DENIED_KEY" });
+		await repository.saveSuccess(claude, previous, first);
+		assert.ok(repository.begin);
+		const token = await repository.begin(claude, denied);
+		await repository.suspend(claude, denied, { token });
+		const restarted = createSnapshotRepository({ directory });
+		assert.deepEqual(await restarted.read(claude, denied), { suspended: true });
+		assert.deepEqual(await restarted.read(claude, previous), { snapshot: first, suspended: false });
+		assert.deepEqual(await restarted.read(claude, "f".repeat(64)), { suspended: false });
+	});
+});
+
+test("a cancelled claimed save retains its barrier and its primary error despite cleanup failure", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		assert.ok(repository.begin);
+		const token = await repository.begin(claude, identity);
+		const controller = new AbortController();
+		const faulty = createSnapshotRepository({ directory, io: {
+			writeFile: async (path, bytes, options) => {
+				await writeFile(path, bytes, options);
+				controller.abort("SYNTHETIC_CANCEL_SECRET");
+			},
+			unlink: async () => { throw new Error("SYNTHETIC_CLEANUP_SECRET"); },
+		} });
+		await assert.rejects(faulty.saveSuccess(claude, identity, { checkedAt: first.checkedAt + 50, records: [] }, { token, signal: controller.signal }), {
+			code: "SNAPSHOT_CANCELLED", message: "SNAPSHOT_CANCELLED",
+		});
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: true });
+	});
+});
+
+test("a late ordinary release cannot overwrite a completed permission suspension for its claim", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		assert.ok(repository.begin);
+		const token = await repository.begin(claude, identity);
+		let reached!: () => void;
+		let resume!: () => void;
+		const entered = new Promise<void>((resolve) => { reached = resolve; });
+		const gate = new Promise<void>((resolve) => { resume = resolve; });
+		const slowRelease = createSnapshotRepository({ directory, io: {
+			writeFile: async (path, bytes, options) => {
+				await writeFile(path, bytes, options);
+				reached();
+				await gate;
+			},
+		} });
+		assert.ok(slowRelease.release);
+		const released = slowRelease.release(claude, identity, { token });
+		await entered;
+		try { await repository.suspend(claude, identity, { token }); } finally { resume(); }
+		await assert.rejects(released, { code: "SNAPSHOT_CANCELLED" });
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: true });
 	});
 });
 
