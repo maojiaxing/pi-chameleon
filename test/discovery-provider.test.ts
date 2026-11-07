@@ -414,3 +414,60 @@ test("a complete discovered catalog is native-composed with user models and over
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("two providers keep independent 15-second budgets: a slow one cannot drag or cover the fast one", async () => {
+	const time = clock();
+	const slowStarted = deferred<void>();
+	const fastStarted = deferred<void>();
+	const slowRelease = deferred<Response>();
+	let slowSignal: AbortSignal | undefined;
+	const fetch: FetchFunction = async (_input, init = {}) => {
+		if (new Headers(init.headers).has("authorization")) {
+			slowSignal = init.signal;
+			slowStarted.resolve();
+			return slowRelease.promise; // Deliberately ignores cancellation.
+		}
+		fastStarted.resolve();
+		return Response.json({ data: [{ id: "claude-fast-dual" }], has_more: false });
+	};
+	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-discovery-dual-"));
+	const states: Record<RelayFamily, string[]> = { claude: [], codex: [] };
+	const providers = (["claude", "codex"] as RelayFamily[]).map((family) => createDiscoveryProvider(family, {
+		fetch, clock: time.value,
+		repository: createSnapshotRepository({ directory: join(directory, `cache-${family}`) }),
+		resolveAccess: async () => ({
+			baseUrl: family === "codex" ? "https://relay.example.test/v1" : "https://relay.example.test",
+			apiKey: `synthetic-${family}-key`, headers: {},
+		}),
+		onChange: (state) => { states[state.provider === codexId ? "codex" : "claude"].push(state.status); },
+	}));
+	try {
+		const path = join(directory, "models.json");
+		await writeFile(path, JSON.stringify({ providers: {
+			[codexId]: config,
+			"chameleon-claude": { baseUrl: "https://relay.example.test", apiKey: "synthetic-claude-key" },
+		} }));
+		const runtime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(), modelsPath: path, modelsStore: new InMemoryModelsStore(),
+			refreshOnCreate: false, allowModelNetwork: false,
+		});
+		for (const { provider } of providers) runtime.registerNativeProvider(provider);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const registry = new ModelRegistry(runtime);
+		const refreshing = registry.refresh({ providers: [codexId, "chameleon-claude"], allowNetwork: true });
+		await Promise.all([slowStarted.promise, fastStarted.promise]);
+		time.advance(15_000);
+		await refreshing;
+		assert.equal(slowSignal?.aborted, true, "the slow provider's own budget must abort its GET");
+		assert.equal(states.codex.at(-1), "failed");
+		assert.deepEqual(runtime.getModels(codexId), [], "the slow provider publishes nothing");
+		assert.ok(states.claude.includes("success"), "the fast provider completes within the same shared clock");
+		assert.deepEqual(runtime.getModels("chameleon-claude").map((model) => model.id), ["claude-fast-dual"]);
+		slowRelease.resolve(Response.json({ data: [{ id: "gpt-late-dual" }] }));
+		await registry.refresh({ providers: [codexId], allowNetwork: false });
+		assert.deepEqual(runtime.getModels(codexId), [], "a late body is never published after the budget");
+	} finally {
+		for (const { dispose } of providers) dispose();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
