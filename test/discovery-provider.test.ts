@@ -423,7 +423,7 @@ test("two providers keep independent 15-second budgets: a slow one cannot drag o
 	let slowSignal: AbortSignal | undefined;
 	const fetch: FetchFunction = async (_input, init = {}) => {
 		if (new Headers(init.headers).has("authorization")) {
-			slowSignal = init.signal;
+			slowSignal = init.signal ?? undefined;
 			slowStarted.resolve();
 			return slowRelease.promise; // Deliberately ignores cancellation.
 		}

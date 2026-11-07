@@ -54,7 +54,7 @@ async function withSession(fetch: FetchFunction, run: (h: {
 	session: AgentSession; registry: ModelRegistry; runtime: ModelRuntime; notifications: string[]; pi: ExtensionAPI;
 	loader: DefaultResourceLoader; contexts: ExtensionContext[]; startReasons: string[];
 }) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0]; noModel?: boolean;
-	providerExtras?: Record<"chameleon-codex" | "chameleon-claude", Record<string, unknown>> } = {}) {
+	providerExtras?: Partial<Record<"chameleon-codex" | "chameleon-claude", Record<string, unknown>>> } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-lifecycle-"));
 	let session: AgentSession | undefined;
 	try {
