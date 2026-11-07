@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { InMemoryCredentialStore, InMemoryModelsStore, type Api, type FetchFunction, type Model } from "@earendil-works/pi-ai";
 import {
 	createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager,
-	type AgentSession, type ExtensionAPI, type ExtensionUIContext,
+	type AgentSession, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { createChameleonExtension } from "../src/index.ts";
 import { createSnapshotRepository } from "../src/discovery/snapshot.ts";
@@ -51,7 +51,8 @@ const explicit: Model<Api> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 async function withSession(fetch: FetchFunction, run: (h: {
-	session: AgentSession; registry: ModelRegistry; notifications: string[]; pi: ExtensionAPI; loader: DefaultResourceLoader;
+	session: AgentSession; registry: ModelRegistry; runtime: ModelRuntime; notifications: string[]; pi: ExtensionAPI;
+	loader: DefaultResourceLoader; contexts: ExtensionContext[]; startReasons: string[];
 }) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0] } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-lifecycle-"));
 	let session: AgentSession | undefined;
@@ -71,6 +72,8 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		const settings = SettingsManager.inMemory(options.settings ?? { defaultProvider: "chameleon-codex", defaultModel: "explicit-session" });
 		const registry = new ModelRegistry(runtime);
 		let pi!: ExtensionAPI;
+		const contexts: ExtensionContext[] = [];
+		const startReasons: string[] = [];
 		const startupRequests = new Set<string>();
 		const startupArmed = deferred<void>();
 		const observedFetch: FetchFunction = (input, init) => {
@@ -83,7 +86,10 @@ async function withSession(fetch: FetchFunction, run: (h: {
 			noPromptTemplates: true, noContextFiles: true,
 			extensionFactories: [{ name: "chameleon-test", factory: createChameleonExtension({
 				fetch: observedFetch, repository: createSnapshotRepository({ directory: join(directory, "catalogs") }),
-			}) }, { name: "public-test-observer", factory(api) { pi = api; } }],
+			}) }, { name: "public-test-observer", factory(api) {
+				pi = api;
+				api.on("session_start", (event, context) => { contexts.push(context); startReasons.push(event.reason); });
+			} }],
 		});
 		await loader.reload();
 		assert.deepEqual(loader.getExtensions().errors, []);
@@ -100,7 +106,7 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		await session.bindExtensions({ uiContext: { notify(message) { notifications.push(message); } } as ExtensionUIContext, mode: "print" });
 		// Wait for external startup GETs to be armed, not completed, before a test starts an ordinary host refresh.
 		if (process.env.PI_OFFLINE === undefined) await startupArmed.promise;
-		await run({ session, registry, notifications, pi, loader });
+		await run({ session, registry, runtime, notifications, get pi() { return pi; }, loader, contexts, startReasons });
 	} finally {
 		if (session) {
 			await session.abort();
@@ -135,6 +141,87 @@ test("the real InlineExtension loader starts background discovery through public
 		assert.equal(requests.length, 2);
 		assert.equal(requests[0].headers.get("authorization") ?? requests[1].headers.get("authorization"), "Bearer synthetic-session-key");
 		assert.ok(notifications.some((n) => n.includes("加载")));
+	});
+});
+
+test("public session.reload cancels the old epoch, restores cache before startup GETs, and preserves selection and defaults", { timeout: 40_000 }, async () => {
+	let phase: "old-pending" | "reloaded" | "cached-reload" = "old-pending";
+	const oldStarted = deferred<void>();
+	const reloadStarted = deferred<void>();
+	const cachedReloadStarted = deferred<void>();
+	const oldResponses = { codex: deferred<Response>(), claude: deferred<Response>() };
+	const reloadResponses = { codex: deferred<Response>(), claude: deferred<Response>() };
+	const cachedReloadResponses = { codex: deferred<Response>(), claude: deferred<Response>() };
+	const requests: { phase: string; family: "codex" | "claude"; signal: AbortSignal }[] = [];
+	let hRef: { registry: ModelRegistry } | undefined;
+	const fetch: FetchFunction = async (_url, init) => {
+		const family = new Headers(init?.headers).has("authorization") ? "codex" : "claude";
+		assert.ok(init?.signal);
+		requests.push({ phase, family, signal: init.signal });
+		if (phase === "old-pending") {
+			if (requests.filter((r) => r.phase === phase).length === 2) oldStarted.resolve();
+			return oldResponses[family].promise; // Deliberately ignores cancellation: a late GET must remain fenced.
+		}
+		if (phase === "cached-reload") {
+			if (requests.filter((r) => r.phase === phase).length === 1) {
+				// The first startup GET after reload must already see the restored cache snapshot.
+				assert.ok(hRef!.registry.find("chameleon-codex", "gpt-reload-new"), "restored cache must be visible before the first startup GET after reload");
+				assert.ok(hRef!.registry.find("chameleon-claude", "claude-reload-new"));
+			}
+			if (requests.filter((r) => r.phase === phase).length === 2) cachedReloadStarted.resolve();
+			return cachedReloadResponses[family].promise;
+		}
+		if (requests.filter((r) => r.phase === phase).length === 2) reloadStarted.resolve();
+		return reloadResponses[family].promise;
+	};
+	await withSession(fetch, async (h) => {
+		hRef = h;
+		const defaults = h.pi.getSettings();
+		const oldContext = h.contexts[0];
+		await oldStarted.promise;
+		const oldRefresh = h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		const oldRequests = requests.filter((r) => r.phase === "old-pending");
+		phase = "reloaded";
+		await h.session.reload({ beforeSessionStart: async () => {
+			// Reload queues native provider registration just like first initialization.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await h.runtime.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: false });
+			assert.equal(h.registry.find("chameleon-codex", "gpt-reload-new"), undefined);
+			assert.equal(requests.filter((r) => r.phase === "reloaded").length, 0, "cache initialization must not start GETs");
+		} });
+		await reloadStarted.promise;
+		assert.deepEqual(h.startReasons, ["startup", "reload"]);
+		assert.notEqual(h.contexts[1], oldContext);
+		assert.ok(oldRequests.every((r) => r.signal.aborted), "old discovery must be cancelled on real reload");
+		assert.equal(h.session.model?.id, "explicit-session");
+		reloadResponses.codex.resolve(Response.json({ data: [{ id: "gpt-reload-new" }] }));
+		reloadResponses.claude.resolve(Response.json({ data: [{ id: "claude-reload-new" }], has_more: false }));
+		await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		oldResponses.codex.resolve(Response.json({ data: [{ id: "gpt-obsolete-epoch" }] }));
+		oldResponses.claude.resolve(Response.json({ data: [{ id: "claude-obsolete-epoch" }], has_more: false }));
+		await oldRefresh;
+		assert.ok(h.registry.find("chameleon-codex", "gpt-reload-new"));
+		assert.ok(h.registry.find("chameleon-claude", "claude-reload-new"));
+		assert.equal(h.registry.find("chameleon-codex", "gpt-obsolete-epoch"), undefined);
+		assert.equal(h.registry.find("chameleon-claude", "claude-obsolete-epoch"), undefined);
+		assert.equal(h.session.model?.id, "explicit-session", "reload must not silently choose a newly discovered ID");
+		assert.deepEqual(h.pi.getSettings(), defaults);
+		await h.pi.setModel(h.registry.find("chameleon-codex", "gpt-reload-new")!);
+		phase = "cached-reload";
+		await h.session.reload({ beforeSessionStart: async () => {
+			// No GET may start before session_start; the pending cache restore itself must stay offline.
+			assert.equal(requests.filter((r) => r.phase === "cached-reload").length, 0);
+		} });
+		await cachedReloadStarted.promise;
+		assert.equal(h.session.model?.id, "gpt-reload-new");
+		cachedReloadResponses.codex.resolve(Response.json({ data: [{ id: "gpt-after-cached-reload" }] }));
+		cachedReloadResponses.claude.resolve(Response.json({ data: [{ id: "claude-after-cached-reload" }], has_more: false }));
+		await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		assert.deepEqual(h.startReasons, ["startup", "reload", "reload"]);
+		assert.ok(h.registry.find("chameleon-codex", "gpt-after-cached-reload"));
+		assert.equal(h.session.model?.id, "gpt-reload-new", "a removed selected ID remains the user's selection");
+		assert.deepEqual(h.pi.getSettings(), defaults);
+		assert.ok(h.notifications.some((n) => n.includes("保留当前会话选择")));
 	});
 });
 
