@@ -2,6 +2,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { chmod, link, mkdir, open, rename, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { createStorageSecurity } from "./storage-security.ts";
 import type {
 	CatalogRecord, CatalogSnapshot, ChameleonProviderId, DiscoveryAccess, OperationGuard,
 	SnapshotRepository, SnapshotState,
@@ -239,8 +240,44 @@ function catalogSnapshot(value: unknown): CatalogSnapshot | undefined {
 
 /** The repository stores only discovery facts, never the access used to discover them. */
 export function createSnapshotRepository(options: SnapshotRepositoryOptions): SnapshotRepository {
+	const security = createStorageSecurity(options.directory);
+	const raw: SnapshotFileIO = {
+		chmod, link, mkdir, readFile: security.openedRead, syncFile, writeFile, rename, unlink, ...options.io,
+	};
+	// Injected file IO remains a fault seam, never a bypass of the storage trust checks.
 	const io: SnapshotFileIO = {
-		chmod, link, mkdir, readFile: boundedRead, syncFile, writeFile, rename, unlink, ...options.io,
+		...raw,
+		mkdir: async (path, settings) => {
+			if (resolve(path) !== security.root) throw new Error("STORAGE_UNTRUSTED");
+			await security.ensureDirectory(async () => { await raw.mkdir(path, settings); });
+		},
+		chmod: async (path, mode) => {
+			if (resolve(path) === security.root) await security.assertRoot();
+			else await security.assertFile(path);
+			await raw.chmod(path, mode);
+		},
+		readFile: async (path, maxBytes) => {
+			await security.assertFile(path);
+			const bytes = await raw.readFile(path, maxBytes);
+			await security.assertFile(path);
+			return bytes;
+		},
+		writeFile: async (path, bytes, settings) => {
+			await security.assertFile(path, true);
+			await raw.writeFile(path, bytes, settings);
+			await security.assertFile(path);
+		},
+		link: async (source, destination) => {
+			await security.assertFile(source);
+			await security.assertFile(destination, true);
+			await raw.link(source, destination);
+			await security.assertFile(destination);
+		},
+		rename: async (source, destination) => {
+			await security.assertFile(source);
+			await security.assertFile(destination, true);
+			await raw.rename(source, destination);
+		},
 	};
 	const file = (provider: ChameleonProviderId) => join(options.directory, `${provider}.json`);
 	async function locked<T>(provider: ChameleonProviderId, guard: OperationGuard | undefined, operation: () => Promise<T>): Promise<T> {
@@ -255,7 +292,7 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 				// Never evict a live lock by age: a stalled holder must not lose its critical section.
 				for (let attempt = 0; attempt < 200; attempt++) {
 					checkGuard(guard);
-					try { handle = await open(path, "wx", 0o600); break; } catch (error) {
+					try { handle = await open(path, "wx", 0o600); await security.assertOpened(path, handle); break; } catch (error) {
 						if (!hasCode(error, "EEXIST")) throw error;
 						await delay(10);
 					}
@@ -269,7 +306,7 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 			} finally {
 				if (handle) {
 					try { await handle.close(); } catch { /* Cleanup cannot replace the primary outcome. */ }
-					try { await unlink(path); } catch { /* A residual lock fails closed, never gets age-evicted. */ }
+					try { await security.assertRoot(); await unlink(path); } catch { /* A residual lock fails closed, never gets age-evicted. */ }
 				}
 			}
 		});
