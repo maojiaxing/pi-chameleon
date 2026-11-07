@@ -53,7 +53,8 @@ const explicit: Model<Api> = {
 async function withSession(fetch: FetchFunction, run: (h: {
 	session: AgentSession; registry: ModelRegistry; runtime: ModelRuntime; notifications: string[]; pi: ExtensionAPI;
 	loader: DefaultResourceLoader; contexts: ExtensionContext[]; startReasons: string[];
-}) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0]; noModel?: boolean } = {}) {
+}) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0]; noModel?: boolean;
+	providerExtras?: Record<"chameleon-codex" | "chameleon-claude", Record<string, unknown>> } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-lifecycle-"));
 	let session: AgentSession | undefined;
 	try {
@@ -62,8 +63,10 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		const path = join(agentDir, "models.json");
 		await writeFile(path, JSON.stringify({ providers: {
 			"chameleon-codex": { baseUrl: "https://relay.example.test/v1", apiKey: "synthetic-session-key", authHeader: true,
-				models: options.noModel ? [] : [{ ...explicit, baseUrl: undefined, provider: undefined }] },
-			"chameleon-claude": { baseUrl: "https://relay.example.test", apiKey: "synthetic-session-key" },
+				models: options.noModel ? [] : [{ ...explicit, baseUrl: undefined, provider: undefined }],
+				...(options.providerExtras?.["chameleon-codex"] ?? {}) },
+			"chameleon-claude": { baseUrl: "https://relay.example.test", apiKey: "synthetic-session-key",
+				...(options.providerExtras?.["chameleon-claude"] ?? {}) },
 		} }));
 		const runtime = await ModelRuntime.create({
 			credentials: new InMemoryCredentialStore(), modelsPath: path, modelsStore: new InMemoryModelsStore(),
@@ -264,6 +267,21 @@ test("a first start without cache, explicit model, or a discovered default does 
 	} finally {
 		process.env = savedEnv;
 	}
+});
+
+test("a user rename via modelOverrides keeps the user's name and still explains that cost is not a relay bill", { timeout: 20_000 }, async () => {
+	const fetch: FetchFunction = async (_url, init) => Response.json(new Headers(init?.headers).has("authorization")
+		? { data: [{ id: "gpt-5.3-codex" }] } : { data: [], has_more: false });
+	await withSession(fetch, async (h) => {
+		await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+		const renamed = h.registry.find("chameleon-codex", "gpt-5.3-codex")!;
+		assert.equal(renamed.name, "我的常用模型", "the user's rename must be preserved, not reverted");
+		const before = h.notifications.length;
+		await h.pi.setModel(renamed);
+		const note = h.notifications.slice(before).join(" ");
+		assert.ok(!note.includes("来自本地官方资料"), "a renamed model must not be presented as official reference pricing");
+		assert.ok(note.includes("不是中转站账单"), "a source-of-cost warning must survive the rename");
+	}, { providerExtras: { "chameleon-codex": { modelOverrides: { "gpt-5.3-codex": { name: "我的常用模型" } } } } });
 });
 
 test("the real session command force-refreshes the requested provider or both and safely reports results without changing defaults", { timeout: 20_000 }, async () => {
