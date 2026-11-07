@@ -53,7 +53,7 @@ const explicit: Model<Api> = {
 async function withSession(fetch: FetchFunction, run: (h: {
 	session: AgentSession; registry: ModelRegistry; runtime: ModelRuntime; notifications: string[]; pi: ExtensionAPI;
 	loader: DefaultResourceLoader; contexts: ExtensionContext[]; startReasons: string[];
-}) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0] } = {}) {
+}) => Promise<void>, options: { settings?: Parameters<typeof SettingsManager.inMemory>[0]; noModel?: boolean } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-lifecycle-"));
 	let session: AgentSession | undefined;
 	try {
@@ -62,14 +62,16 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		const path = join(agentDir, "models.json");
 		await writeFile(path, JSON.stringify({ providers: {
 			"chameleon-codex": { baseUrl: "https://relay.example.test/v1", apiKey: "synthetic-session-key", authHeader: true,
-				models: [{ ...explicit, baseUrl: undefined, provider: undefined }] },
+				models: options.noModel ? [] : [{ ...explicit, baseUrl: undefined, provider: undefined }] },
 			"chameleon-claude": { baseUrl: "https://relay.example.test", apiKey: "synthetic-session-key" },
 		} }));
 		const runtime = await ModelRuntime.create({
 			credentials: new InMemoryCredentialStore(), modelsPath: path, modelsStore: new InMemoryModelsStore(),
 			refreshOnCreate: false, allowModelNetwork: false,
 		});
-		const settings = SettingsManager.inMemory(options.settings ?? { defaultProvider: "chameleon-codex", defaultModel: "explicit-session" });
+		const settings = SettingsManager.inMemory(options.settings ?? (options.noModel
+			? { defaultProvider: "chameleon-codex", defaultModel: "missing-first-start-default" }
+			: { defaultProvider: "chameleon-codex", defaultModel: "explicit-session" }));
 		const registry = new ModelRegistry(runtime);
 		let pi!: ExtensionAPI;
 		const contexts: ExtensionContext[] = [];
@@ -95,7 +97,8 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		assert.deepEqual(loader.getExtensions().errors, []);
 		const created = await createAgentSession({
 			cwd: directory, agentDir, modelRuntime: runtime, resourceLoader: loader,
-			settingsManager: settings, sessionManager: SessionManager.inMemory(directory), model: explicit, noTools: "all",
+			settingsManager: settings, sessionManager: SessionManager.inMemory(directory),
+			...(options.noModel ? {} : { model: explicit }), noTools: "all",
 		});
 		session = created.session;
 		// Native registration queues cache-only refreshes. Let them enter, then await the public initialization barrier.
@@ -223,6 +226,44 @@ test("public session.reload cancels the old epoch, restores cache before startup
 		assert.deepEqual(h.pi.getSettings(), defaults);
 		assert.ok(h.notifications.some((n) => n.includes("保留当前会话选择")));
 	});
+});
+
+test("a first start without cache, explicit model, or a discovered default does not auto-select and guides the user", { timeout: 40_000 }, async () => {
+	const savedEnv = { ...process.env };
+	// Isolate ambient shell credentials so no built-in provider can satisfy SDK initial selection.
+	for (const key of Object.keys(process.env))
+		if (/(ANTHROPIC|OPENAI|GOOGLE|GEMINI|XAI|GROQ|MISTRAL|OPENROUTER|DEEPSEEK|AZURE|CLAUDE|CODEX).*(KEY|TOKEN)/i.test(key)) delete process.env[key];
+	try {
+		const responses = { codex: deferred<Response>(), claude: deferred<Response>() };
+		const started = deferred<void>();
+		let startedCount = 0;
+		const fetch: FetchFunction = async (_url, init) => {
+			if (++startedCount === 2) started.resolve();
+			return new Headers(init?.headers).has("authorization") ? responses.codex.promise : responses.claude.promise;
+		};
+		await withSession(fetch, async (h) => {
+			await started.promise;
+			const placeholder = h.session.model!;
+			assert.ok(placeholder.id === "unknown" && placeholder.provider === "unknown",
+				`SDK initial selection must stay on the unknown placeholder without cache, explicit model, or ambient credentials: ${placeholder.provider}/${placeholder.id}`);
+			assert.ok(h.notifications.some((n) => n.includes("正在后台加载")), "loading guidance must be visible");
+			assert.equal(h.registry.find("chameleon-codex", "gpt-first-start"), undefined, "nothing is public before discovery completes");
+			const settings = h.pi.getSettings();
+			responses.codex.resolve(Response.json({ data: [{ id: "gpt-first-start" }] }));
+			responses.claude.resolve(Response.json({ data: [{ id: "claude-first-start" }], has_more: false }));
+			await h.registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
+			assert.ok(h.registry.find("chameleon-codex", "gpt-first-start"));
+			assert.ok(h.registry.find("chameleon-claude", "claude-first-start"));
+			assert.deepEqual([h.session.model?.provider, h.session.model?.id], ["unknown", "unknown"],
+				"discovery completion must not auto-select a Chameleon model");
+			assert.ok(h.notifications.some((n) => n.includes("默认模型尚未发现") && n.includes("未修改")), "default-model guidance must be visible");
+			await h.pi.setModel(h.registry.find("chameleon-codex", "gpt-first-start")!);
+			assert.equal(h.session.model?.id, "gpt-first-start");
+			assert.deepEqual(h.pi.getSettings(), settings);
+		}, { noModel: true });
+	} finally {
+		process.env = savedEnv;
+	}
 });
 
 test("the real session command force-refreshes the requested provider or both and safely reports results without changing defaults", { timeout: 20_000 }, async () => {
