@@ -419,6 +419,7 @@ test("two providers keep independent 15-second budgets: a slow one cannot drag o
 	const time = clock();
 	const slowStarted = deferred<void>();
 	const fastStarted = deferred<void>();
+	const fastPublished = deferred<void>();
 	const slowRelease = deferred<Response>();
 	let slowSignal: AbortSignal | undefined;
 	const fetch: FetchFunction = async (_input, init = {}) => {
@@ -439,7 +440,10 @@ test("two providers keep independent 15-second budgets: a slow one cannot drag o
 			baseUrl: family === "codex" ? "https://relay.example.test/v1" : "https://relay.example.test",
 			apiKey: `synthetic-${family}-key`, headers: {},
 		}),
-		onChange: (state) => { states[state.provider === codexId ? "codex" : "claude"].push(state.status); },
+		onChange: (state) => {
+			states[state.provider === codexId ? "codex" : "claude"].push(state.status);
+			if (state.provider === "chameleon-claude" && state.status === "success") fastPublished.resolve();
+		},
 	}));
 	try {
 		const path = join(directory, "models.json");
@@ -455,7 +459,7 @@ test("two providers keep independent 15-second budgets: a slow one cannot drag o
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		const registry = new ModelRegistry(runtime);
 		const refreshing = registry.refresh({ providers: [codexId, "chameleon-claude"], allowNetwork: true });
-		await Promise.all([slowStarted.promise, fastStarted.promise]);
+		await Promise.all([slowStarted.promise, fastStarted.promise, fastPublished.promise]);
 		time.advance(15_000);
 		await refreshing;
 		assert.equal(slowSignal?.aborted, true, "the slow provider's own budget must abort its GET");
