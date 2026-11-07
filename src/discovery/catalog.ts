@@ -99,6 +99,7 @@ function catalogRecord(family: RelayFamily, item: Record<string, unknown> & { id
 }
 
 function isCandidate(family: RelayFamily, id: string): boolean {
+	if (id.includes("/")) return false;
 	const belongs = family === "claude" ? /^claude-.+/i.test(id) : /^(?:(?:gpt|chatgpt|codex)-.+|o\d+(?:-.+)?)$/i.test(id);
 	return belongs && !/(?:^|[-_.])(?:image|audio|realtime|embedding|embeddings|tts|transcribe|transcription|speech)(?:$|[-_.])/i.test(id);
 }

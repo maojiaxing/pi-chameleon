@@ -69,6 +69,19 @@ async function withDiscovery(
 	}
 }
 
+test("runtime rejects namespaced automatic candidates but preserves raw IDs and explicit models", async () => {
+	for (const family of ["claude", "codex"] as const) {
+		const raw = family === "claude" ? ["claude-future"] : ["gpt-future", "chatgpt-future", "codex-future", "o9-future"];
+		const namespaced = raw.map((id) => `${id}/unknown-alias`);
+		const explicit = namespaced[0];
+		const net = network({ data: [...raw, ...namespaced].map((id) => ({ id })), has_more: false });
+		await withDiscovery(family, { api: family === "claude" ? "anthropic-messages" : "openai-responses", baseUrl: "https://relay.example.test/v1", apiKey: "synthetic", models: [{ id: explicit, name: "Explicit namespace", contextWindow: 8192, maxTokens: 1024, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }, net.fetch, async (runtime) => {
+			await refresh(runtime, family);
+			assert.deepEqual(runtime.getModels(`chameleon-${family}`).map((model) => model.id).sort(), [...raw, explicit].sort());
+		});
+	}
+});
+
 const codexConfig = { baseUrl: "https://relay.example.test/gateway/v1", apiKey: "synthetic-effective-key" };
 
 async function refresh(runtime: ModelRuntime, family: RelayFamily, signal?: AbortSignal) {
