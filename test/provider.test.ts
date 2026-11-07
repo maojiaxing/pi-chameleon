@@ -4,33 +4,75 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { InMemoryCredentialStore, InMemoryModelsStore, type Provider } from "@earendil-works/pi-ai";
-import { ModelRuntime, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import chameleon from "../src/index.ts";
-import { capture, claudeTextResponse, codexTextResponse, context, object } from "./fixtures.ts";
+import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { createChameleonExtension } from "../src/index.ts";
+import { createSnapshotRepository } from "../src/discovery/snapshot.ts";
+import { capture, claudeTextResponse, codexTextResponse, context, object, CLAUDE_FIXTURE_MODELS, CODEX_FIXTURE_MODELS, codexModel } from "./fixtures.ts";
 
-function registrations(): Provider[] {
-	const providers: Provider[] = [];
-	chameleon({ registerProvider: (provider: Provider) => { providers.push(provider); } } as ExtensionAPI);
-	return providers;
+// Chat regressions use explicit test-only definitions, never a production member catalog.
+function syntheticConfig(config: unknown) {
+	const result = structuredClone(config) as { providers?: Record<string, Record<string, unknown>> };
+	for (const [id, provider] of Object.entries(result.providers ?? {})) {
+		const fixtures = id === "chameleon-claude" ? CLAUDE_FIXTURE_MODELS : id === "chameleon-codex" ? CODEX_FIXTURE_MODELS : [];
+		const api = id === "chameleon-claude" ? "anthropic-messages" : "openai-responses";
+		const definitions = new Map<string, Record<string, unknown>>(fixtures.map((fixture) => [fixture.id, { ...fixture, api }]));
+		const declared = provider.models ?? [];
+		assert.ok(Array.isArray(declared));
+		for (const definition of declared) {
+			const model = object(definition);
+			assert.equal(typeof model.id, "string");
+			definitions.set(model.id as string, { ...definitions.get(model.id as string), ...model });
+		}
+		provider.models = [...definitions.values()];
+	}
+	return result;
 }
 
 async function withRuntime(
 	config: unknown,
-	run: (runtime: ModelRuntime, path: string, credentials: InMemoryCredentialStore) => Promise<void>,
+	run: (runtime: ModelRuntime, path: string, credentials: InMemoryCredentialStore, providers: Provider[]) => Promise<void>,
 ) {
 	const dir = await mkdtemp(join(tmpdir(), "pi-chameleon-models-config-"));
 	const path = join(dir, "models.json");
 	const credentials = new InMemoryCredentialStore();
+	let session: AgentSession | undefined;
 	try {
-		await writeFile(path, JSON.stringify(config));
+		await writeFile(path, JSON.stringify(syntheticConfig(config)));
 		const runtime = await ModelRuntime.create({
 			credentials, modelsPath: path, modelsStore: new InMemoryModelsStore(),
 			allowModelNetwork: false, refreshOnCreate: false,
 		});
-		for (const provider of registrations()) runtime.registerNativeProvider(provider);
-		await run(runtime, path, credentials);
+		const settings = SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off" });
+		const registry = new ModelRegistry(runtime);
+		const loader = new DefaultResourceLoader({
+			cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noThemes: true,
+			noContextFiles: true, noPromptTemplates: true,
+			extensionFactories: [createChameleonExtension({
+				repository: createSnapshotRepository({ directory: join(dir, "catalogs") }),
+				fetch: async () => Response.json({
+					data: [...CLAUDE_FIXTURE_MODELS, ...CODEX_FIXTURE_MODELS].map(({ id }) => ({ id })),
+					has_more: false,
+				}),
+			}), (pi) => {
+				// Wait until startup has been superseded by an explicitly awaited native discovery pass.
+				pi.on("session_start", async () => {
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					await registry.refresh({ allowNetwork: true, force: true });
+				});
+			}],
+		});
+		await loader.reload();
+		assert.deepEqual(loader.getExtensions().errors, []);
+		({ session } = await createAgentSession({
+			cwd: dir, agentDir: dir, modelRuntime: runtime, resourceLoader: loader, settingsManager: settings,
+			sessionManager: SessionManager.inMemory(dir), model: codexModel(), noTools: "all",
+		}));
+		await session.bindExtensions({ mode: "print" });
+		const providers = ["chameleon-claude", "chameleon-codex"].map((id) => runtime.getRegisteredNativeProvider(id)!);
+		await run(runtime, path, credentials, providers);
 	} finally {
-		await rm(dir, { recursive: true, force: true });
+		if (session) { await session.abort(); await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); }
+		await rm(dir, { recursive: true, force: true, maxRetries: 3 });
 	}
 }
 
@@ -42,17 +84,16 @@ const shared = {
 };
 
 test("native registration has no environment gate, credentials or guessed upstream", async () => {
-	const providers = registrations();
-	assert.deepEqual(providers.map((p) => p.id), ["chameleon-claude", "chameleon-codex"]);
-	for (const provider of providers) {
-		assert.equal(provider.auth.oauth, undefined);
-		assert.equal(provider.getModels().length, 3);
-		assert.ok(provider.getModels().every((model) => model.baseUrl === ""));
-		assert.equal(provider.baseUrl, undefined);
-	}
-	await withRuntime({}, async (runtime) => {
-		assert.equal(runtime.getModels("chameleon-claude").length, 3);
-		assert.equal(runtime.getModels("chameleon-codex").length, 3);
+	await withRuntime({}, async (runtime, _path, _credentials, providers) => {
+		assert.deepEqual(providers.map((p) => p.id), ["chameleon-claude", "chameleon-codex"]);
+		for (const provider of providers) {
+			assert.equal(provider.auth.oauth, undefined);
+			assert.deepEqual(provider.getModels(), []);
+			assert.ok(provider.refreshModels);
+			assert.equal(provider.baseUrl, undefined);
+		}
+		assert.equal(runtime.getModels("chameleon-claude").length, 0);
+		assert.equal(runtime.getModels("chameleon-codex").length, 0);
 		assert.equal((await runtime.getAvailable("chameleon-claude")).length, 0);
 		assert.equal((await runtime.getAvailable("chameleon-codex")).length, 0);
 	});
@@ -127,8 +168,8 @@ test("Pi refresh reloads models.json and native credential precedence stays inta
 		await runtime.completeSimple(model, context(), { fetch: mock.fetch, apiKey: "runtime-fixture-key" });
 		assert.equal(mock.requests[1].headers.get("authorization"), "Bearer runtime-fixture-key");
 		await credentials.delete("chameleon-codex");
-		await writeFile(path, JSON.stringify({ providers: { "chameleon-codex": { baseUrl: "https://new-relay.example.com/openai", apiKey: "new-fixture-key" } } }));
-		const refreshed = await runtime.refresh({ allowNetwork: false, providers: ["chameleon-codex"] });
+		await writeFile(path, JSON.stringify(syntheticConfig({ providers: { "chameleon-codex": { baseUrl: "https://new-relay.example.com/openai", apiKey: "new-fixture-key" } } })));
+		const refreshed = await runtime.refresh({ allowNetwork: true, force: true, providers: ["chameleon-codex"] });
 		assert.equal(refreshed.errors.size, 0);
 		model = runtime.getModel("chameleon-codex", "gpt-5.3-codex")!;
 		await runtime.completeSimple(model, context(), { fetch: mock.fetch });
@@ -155,12 +196,11 @@ test("native raw stream retains provider-specific reasoning options and disguise
 });
 
 test("apiKey without baseUrl fails closed rather than guessing an upstream", { timeout: 20_000 }, async () => {
-	await withRuntime({ providers: { "chameleon-codex": { apiKey: "fixture-key" } } }, async (runtime) => {
-		const model = runtime.getModel("chameleon-codex", "gpt-5.3-codex")!;
+	await withRuntime({ providers: { "chameleon-codex": { apiKey: "fixture-key" } } }, async (_runtime, _path, _credentials, providers) => {
+		const model = { ...codexModel(), baseUrl: "" };
 		const mock = capture(codexTextResponse);
-		const result = await runtime.completeSimple(model, context(), { fetch: mock.fetch });
-		assert.equal(result.stopReason, "error");
-		assert.match(result.errorMessage ?? "", /baseUrl.*models.json/);
+		// A missing base URL is not a valid models.json definition. Exercise the native public stream with a synthetic model.
+		assert.throws(() => providers[1].streamSimple(model, context(), { fetch: mock.fetch, apiKey: "fixture-key" }), /baseUrl.*models.json/);
 		assert.equal(mock.requests.length, 0);
 	});
 });
