@@ -13,7 +13,7 @@
     ]
   },
   "scripts": {
-    "test": "node --test \"test/*.test.ts\"",
+    "test": "node --test --test-concurrency=3 \"test/*.test.ts\"",
     "check": "tsc -p tsconfig.json"
   },
   "peerDependencies": {

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -16,6 +18,30 @@ async function directories(run: (cache: string, outside: string) => Promise<void
 		await rm(outside, { recursive: true, force: true });
 	}
 }
+
+const exec = promisify(execFile);
+
+test("Windows refuses an Everyone-readable key even after ordinary chmod", { skip: process.platform !== "win32" }, async () => {
+	await directories(async (cache) => {
+		const repository = createSnapshotRepository({ directory: cache });
+		await repository.identity(access);
+		const path = join(cache, "identity.key");
+		await exec("icacls.exe", [path, "/grant", "*S-1-1-0:(R)"], { windowsHide: true });
+		const acl = await exec("icacls.exe", [path], { windowsHide: true });
+		assert.match(acl.stdout, /(?:Everyone|S-1-1-0)/);
+		await assert.rejects(repository.identity(access), { code: "SNAPSHOT_IDENTITY_FAILED", message: "SNAPSHOT_IDENTITY_FAILED" });
+	});
+});
+
+test("Windows refuses a snapshot with an explicit foreign-readable DACL", { skip: process.platform !== "win32" }, async () => {
+	await directories(async (cache) => {
+		const repository = createSnapshotRepository({ directory: cache });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(provider, identity, snapshot);
+		await exec("icacls.exe", [join(cache, `${provider}.json`), "/grant", "*S-1-1-0:(R)"], { windowsHide: true });
+		assert.deepEqual(await repository.read(provider, identity), { suspended: false });
+	});
+});
 
 test("a key symlink is never accepted or used to alter its external target", async () => {
 	await directories(async (cache, outside) => {
@@ -58,5 +84,21 @@ test("a cache root junction or directory symlink never writes into its external 
 			});
 			await assert.rejects(readFile(join(outside, "identity.key")), { code: "ENOENT" });
 		} finally { await rm(alias, { force: true }); }
+	});
+});
+
+test("a private Windows catalog survives repeated identity checks, commits and a fresh repository", { skip: process.platform !== "win32" }, async () => {
+	await directories(async (cache) => {
+		const repository = createSnapshotRepository({ directory: cache });
+		const identity = await repository.identity(access);
+		assert.equal(await repository.identity(access), identity);
+		await repository.saveSuccess(provider, identity, snapshot);
+		await repository.suspend(provider, identity);
+		assert.deepEqual(await repository.read(provider, identity), { snapshot, suspended: true });
+		const recovered = createSnapshotRepository({ directory: cache });
+		assert.equal(await recovered.identity(access), identity);
+		assert.deepEqual(await recovered.read(provider, identity), { snapshot, suspended: true });
+		await recovered.saveSuccess(provider, identity, { checkedAt: 456, records: [] });
+		assert.deepEqual(await repository.read(provider, identity), { snapshot: { checkedAt: 456, records: [] }, suspended: false });
 	});
 });

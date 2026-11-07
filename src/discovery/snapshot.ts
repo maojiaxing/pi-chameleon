@@ -121,24 +121,6 @@ async function syncFile(path: string): Promise<void> {
 	try { await handle.sync(); } finally { await handle.close(); }
 }
 
-async function boundedRead(path: string, maxBytes: number): Promise<Buffer> {
-	const handle = await open(path, "r");
-	try {
-		const stat = await handle.stat();
-		if (!stat.isFile() || stat.size > maxBytes) throw new Error("STORAGE_INVALID");
-		const bytes = Buffer.alloc(maxBytes + 1);
-		let size = 0;
-		while (size < bytes.length) {
-			const result = await handle.read(bytes, size, bytes.length - size, size);
-			if (result.bytesRead === 0) break;
-			size += result.bytesRead;
-		}
-		if (size > maxBytes) throw new Error("STORAGE_INVALID");
-		return bytes.subarray(0, size);
-	} finally {
-		await handle.close();
-	}
-}
 
 type ObjectFields = Record<string, unknown>;
 const object = (value: unknown): value is ObjectFields => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -312,6 +294,7 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 		});
 	}
 	async function identity(access: DiscoveryAccess): Promise<string> {
+		return security.scope(async () => {
 		try {
 			const url = new URL(access.baseUrl);
 			if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) {
@@ -329,6 +312,7 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 		} catch {
 			throw new SnapshotRepositoryError("SNAPSHOT_IDENTITY_FAILED");
 		}
+		});
 	}
 	async function load(provider: ChameleonProviderId, guard?: OperationGuard, strict = false): Promise<Envelope | undefined> {
 		try {
@@ -362,6 +346,7 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 		}
 	}
 	async function read(provider: ChameleonProviderId, digest: string, guard?: OperationGuard): Promise<SnapshotState> {
+		return security.scope(async () => {
 		checkGuard(guard);
 		if (!validProvider(provider) || !validIdentity(digest)) return { suspended: false };
 		try {
@@ -378,6 +363,7 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 			if (error instanceof SnapshotRepositoryError && error.code === "SNAPSHOT_CANCELLED") throw error;
 			return { suspended: false };
 		}
+		});
 	}
 	async function removeTemporary(path: string): Promise<void> {
 		try { await io.unlink(path); } catch { /* Cleanup never changes a commit or its primary failure. */ }
@@ -462,11 +448,11 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 	}
 	return {
 		identity, read,
-		begin: async (provider, digest, guard) => (await claim(provider, digest, guard)).token,
-		release: async (provider, digest, guard) => {
+		begin: async (provider, digest, guard) => security.scope(async () => (await claim(provider, digest, guard)).token),
+		release: async (provider, digest, guard) => security.scope(async () => {
 			await updateClaim(provider, digest, guard, (state) => ({ ...state, pending: false }));
-		},
-		saveSuccess: async (provider, digest, snapshot: CatalogSnapshot, guard) => {
+		}),
+		saveSuccess: async (provider, digest, snapshot: CatalogSnapshot, guard) => security.scope(async () => {
 			checkGuard(guard);
 			let safe: CatalogSnapshot | undefined;
 			try { safe = catalogSnapshot(snapshot); } catch { throw new SnapshotRepositoryError("SNAPSHOT_INVALID"); }
@@ -479,8 +465,8 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 			};
 			if (guard?.token !== undefined) await save();
 			else await serializeWrite(`${file(provider)}.legacy`, save);
-		},
-		suspend: async (provider, digest, guard) => {
+		}),
+		suspend: async (provider, digest, guard) => security.scope(async () => {
 			const suspend = async () => {
 				const owner = await claimedGuard(provider, digest, guard);
 				await updateClaim(provider, digest, owner, (state) => ({
@@ -490,6 +476,6 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 			};
 			if (guard?.token !== undefined) await suspend();
 			else await serializeWrite(`${file(provider)}.legacy`, suspend);
-		},
+		}),
 	};
 }
