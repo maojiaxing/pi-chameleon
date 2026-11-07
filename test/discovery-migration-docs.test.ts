@@ -80,7 +80,7 @@ test("a user can add the documented private alias through real Pi without a disc
 	}
 });
 
-test("users can copy scoped refresh commands and understand stale catalogs, unknown fees and unverified safety", async () => {
+test("users can copy scoped refresh commands and distinguish verified host behavior from untested service and platform guarantees", async () => {
 	const guide = await readGuide();
 	const discovery = section(guide, "模型发现");
 	const refresh = section(guide, "目录刷新与缓存");
@@ -106,9 +106,11 @@ test("users can copy scoped refresh commands and understand stale catalogs, unkn
 		["unknown budgets are provisional", capabilities, /32768[\s\S]*4096[\s\S]*客户端预算/],
 		["unknown inputs and reasoning are conservative", capabilities, /input: \["text"\][\s\S]*reasoning: false/],
 		["reference and unknown estimates are not actual bills or free", capabilities, /参考费用.*不是中转站实际账单[\s\S]*0 占位[\s\S]*费用未知[\s\S]*不代表免费/],
-		["safety boundaries still require final acceptance", refresh, /Windows ACL.*跨进程故障.*仍需最终验收/],
+		["private storage boundaries and unsupported physical failures are stated", refresh, /Windows ACL.*跨进程.*验证[\s\S]*掉电.*POSIX.*未验证/],
 	];
 	for (const [contract, text, pattern] of requirements) assert.ok(pattern.test(text), contract);
-	assert.ok(/尚未完成最终真实 Pi 1\.5\.0.*验收/.test(guide));
+	assert.ok(/已通过真实 Pi 1\.5\.0.*集成验收/.test(guide));
+	assert.ok(/串行.*测试文件.*ACL.*争用/.test(guide));
+	assert.ok(/无条件.*跨重启.*保证/.test(guide));
 	assert.ok(/未调用真实中转站/.test(guide));
 });
