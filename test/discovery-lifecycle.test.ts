@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +14,31 @@ import {
 import { createChameleonExtension } from "../src/index.ts";
 import { createSnapshotRepository } from "../src/discovery/snapshot.ts";
 import { claudeTextResponse } from "./fixtures.ts";
+
+test("defined empty PI_OFFLINE blocks startup, commands, and direct forced refresh in a real isolated session", { timeout: 40_000 }, async () => {
+	if (process.env.CHAMELEON_TEST_OFFLINE !== "1") {
+		// Node's child-v8 test protocol suppresses human stdout when inherited by a nested --test process.
+		const env: NodeJS.ProcessEnv = { ...process.env, PI_OFFLINE: "", CHAMELEON_TEST_OFFLINE: "1" };
+		delete env.NODE_TEST_CONTEXT;
+		const result = await promisify(execFile)(process.execPath, ["--test", "--test-reporter=tap", "--test-name-pattern=defined empty PI_OFFLINE", fileURLToPath(import.meta.url)], {
+			cwd: fileURLToPath(new URL("../", import.meta.url)), env, timeout: 30_000,
+		}).catch((error: unknown) => {
+			const failure = error as { code?: number | string; stdout?: string; stderr?: string };
+			assert.fail(`offline child exited ${failure.code ?? "unknown"}\nstdout: ${failure.stdout ?? ""}\nstderr: ${failure.stderr ?? ""}`);
+		});
+		assert.match(result.stdout, /# pass 1\b/, `offline child stderr: ${result.stderr}`);
+		return;
+	}
+	assert.equal(process.env.PI_OFFLINE, "");
+	let requests = 0;
+	await withSession(async () => { requests++; throw new Error("offline must not request a catalog"); }, async ({ session, registry, notifications }) => {
+		await registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true, force: true });
+		await session.prompt("/chameleon-models-refresh");
+		assert.equal(requests, 0);
+		assert.equal(session.model?.id, "explicit-session");
+		assert.ok(notifications.some((n) => n.includes("离线模式")));
+	});
+});
 
 function deferred<T>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;

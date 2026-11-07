@@ -131,9 +131,9 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 						const auth = await bound.modelRegistry.getProviderAuth(id);
 						if (ctx !== bound || epoch !== expected) return;
 						if (!auth) { notify({ provider: id, status: "unconfigured" }); return; }
-						await bound.modelRegistry.refresh({ providers: [id], allowNetwork: !process.env.PI_OFFLINE, force: true, signal: lifetime.signal });
+						await bound.modelRegistry.refresh({ providers: [id], allowNetwork: process.env.PI_OFFLINE === undefined, force: true, signal: lifetime.signal });
 						if (ctx === bound && epoch === expected) {
-							if (process.env.PI_OFFLINE) bound.ui.notify(`Chameleon ${family === "claude" ? "Claude" : "Codex"}：离线模式仅恢复缓存，未发起网络请求。`, "info");
+							if (process.env.PI_OFFLINE !== undefined) bound.ui.notify(`Chameleon ${family === "claude" ? "Claude" : "Codex"}：离线模式仅恢复缓存，未发起网络请求。`, "info");
 							else notify(states.get(id) ?? { provider: id, status: "failed" });
 						}
 					} catch { if (ctx === bound && epoch === expected) notify({ provider: id, status: "failed" }); }
@@ -167,7 +167,7 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 			const expected = epoch;
 			// Startup/reload never waits for network. The public refresh remains a completion barrier for callers.
 			void context.modelRegistry.refresh({ providers: families.map((family) => `chameleon-${family}`),
-				allowNetwork: !process.env.PI_OFFLINE, force: true, signal: lifetime.signal }).then(async () => {
+				allowNetwork: process.env.PI_OFFLINE === undefined, force: true, signal: lifetime.signal }).then(async () => {
 				if (ctx === context && epoch === expected) { await bridge(); missingDefault(); }
 			}).catch(() => {
 				if (ctx === context && epoch === expected) notify({ provider: "chameleon-codex", status: "failed" });
