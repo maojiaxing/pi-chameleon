@@ -79,6 +79,23 @@ test("serialized bytes contain only validated discovery facts, not runtime objec
 	});
 });
 
+test("safe partial pricing and numeric tier facts survive snapshot restoration without raw fields", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		const snapshot: CatalogSnapshot = JSON.parse(`{"checkedAt":1700000000000,"records":[
+			{"id":"gpt-5.4","cost":{"input":0,"tiers":[{"inputTokensAbove":272000,"input":5,"output":22.5,"cacheRead":0.5,"cacheWrite":0,"raw":"SYNTHETIC_TIER_SECRET"}],"authorization":"SYNTHETIC_COST_SECRET"}}
+		]}`);
+		await repository.saveSuccess(codex, identity, snapshot);
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(codex, identity), {
+			suspended: false, snapshot: { checkedAt: first.checkedAt, records: [{ id: "gpt-5.4", cost: {
+				input: 0, tiers: [{ inputTokensAbove: 272_000, input: 5, output: 22.5, cacheRead: 0.5, cacheWrite: 0 }],
+			} }] },
+		});
+		for (const name of await readdir(directory)) assert.doesNotMatch((await readFile(join(directory, name))).toString(), /SYNTHETIC_(TIER|COST)_SECRET/);
+	});
+});
+
 test("identity tracks effective access semantics but never leaks the raw credentials", async () => {
 	await withDirectory(async (directory) => {
 		const repository = createSnapshotRepository({ directory });

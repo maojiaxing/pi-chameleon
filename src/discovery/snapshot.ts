@@ -193,9 +193,25 @@ function catalogSnapshot(value: unknown): CatalogSnapshot | undefined {
 		}
 		if (candidate.cost !== undefined) {
 			if (!object(candidate.cost)) return;
-			const { input, output, cacheRead, cacheWrite } = candidate.cost;
-			if (!rate(input) || !rate(output) || !rate(cacheRead) || !rate(cacheWrite)) return;
-			record.cost = { input, output, cacheRead, cacheWrite };
+			const cost: NonNullable<CatalogRecord["cost"]> = {};
+			for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+				const value = candidate.cost[field];
+				if (value !== undefined) {
+					if (!rate(value)) return;
+					cost[field] = value;
+				}
+			}
+			if (candidate.cost.tiers !== undefined) {
+				if (!Array.isArray(candidate.cost.tiers) || candidate.cost.tiers.length > 100) return;
+				cost.tiers = [];
+				for (const tier of candidate.cost.tiers) {
+					if (!object(tier)) return;
+					const { inputTokensAbove, input, output, cacheRead, cacheWrite } = tier;
+					if (!rate(inputTokensAbove) || !rate(input) || !rate(output) || !rate(cacheRead) || !rate(cacheWrite)) return;
+					cost.tiers.push({ inputTokensAbove, input, output, cacheRead, cacheWrite });
+				}
+			}
+			record.cost = cost;
 		}
 		records.push(record);
 	}

@@ -20,7 +20,7 @@ export interface CatalogRecord {
 	reasoning?: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 	compat?: Model<Api>["compat"];
-	cost?: Model<Api>["cost"];
+	cost?: Partial<Model<Api>["cost"]>;
 }
 
 export interface CatalogSnapshot {
