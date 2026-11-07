@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -81,6 +81,92 @@ test("native discovery starts empty and does not restore an unconfirmed identity
 		await registry.refresh({ providers: [codexId], allowNetwork: false });
 		assert.equal(net.requests.length, 0);
 	}, { providerConfig: config });
+});
+
+test("a successful empty catalog replaces the one automatic snapshot while ordinary failures retain it and explicit models", async () => {
+	const net = network({ data: [{ id: "gpt-first" }, { id: "gpt-removed" }] }, new Error("transport synthetic-list-key"), { data: [] });
+	await withRuntime(net.fetch, async ({ runtime, registry, repository, bind, states }) => {
+		bind();
+		const refresh = () => registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+		await refresh();
+		await refresh();
+		assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["gpt-first", "gpt-removed", "explicit-only"]);
+		assert.ok(states.includes("failed"));
+		await refresh();
+		assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["explicit-only"]);
+		const identity = await repository.identity({ baseUrl: config.baseUrl, apiKey: config.apiKey, headers: { authorization: "Bearer synthetic-list-key" } });
+		assert.deepEqual((await repository.read(codexId, identity)).snapshot?.records, []);
+		assert.equal(states.at(-1), "empty");
+	}, { providerConfig: { ...config, models: [{ id: "explicit-only", api: "openai-responses", name: "User choice", reasoning: false }] } });
+});
+
+test("list permission failure suspends automatic candidates across restart until a complete success without deleting explicit models", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-suspended-restart-"));
+	const repository = createSnapshotRepository({ directory });
+	const providerConfig = { ...config, models: [{ id: "explicit-only", api: "openai-responses", name: "User choice", reasoning: false }] };
+	try {
+		await withRuntime(network({ data: [{ id: "gpt-permitted" }] }, new Response("synthetic-list-key not allowed", { status: 403 })).fetch,
+			async ({ registry, runtime, bind, states }) => {
+				bind();
+				await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+				await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+				assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["explicit-only"]);
+				assert.equal(states.at(-1), "suspended");
+			}, { repository, providerConfig });
+		await withRuntime(network(new Error("offline"), { data: [{ id: "gpt-restored" }] }).fetch,
+			async ({ registry, runtime, bind }) => {
+				bind();
+				await registry.refresh({ providers: [codexId], allowNetwork: false });
+				assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["explicit-only"]);
+				await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+				assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["explicit-only"]);
+				await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+				assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["gpt-restored", "explicit-only"]);
+			}, { repository, providerConfig });
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a successful discovery with failed persistence remains the latest in-memory catalog and restart uses the intact old success", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-failed-save-"));
+	let failWrites = false;
+	const repository = createSnapshotRepository({ directory, io: { async rename(from, to) {
+		if (failWrites) throw new Error("storage synthetic-list-key");
+		await rename(from, to);
+	} } });
+	try {
+		await withRuntime(network({ data: [{ id: "gpt-old" }] }, { data: [{ id: "gpt-new" }] }).fetch,
+			async ({ registry, runtime, bind, states }) => {
+				bind();
+				await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+				failWrites = true;
+				await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+				assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["gpt-new"]);
+				assert.equal(states.at(-1), "unsaved");
+				await registry.refresh({ providers: [codexId], allowNetwork: false });
+				assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["gpt-new"]);
+			}, { repository });
+		await withRuntime(network().fetch, async ({ bind, registry, runtime }) => {
+			bind();
+			await registry.refresh({ providers: [codexId], allowNetwork: false });
+			assert.deepEqual(runtime.getModels(codexId).map((m) => m.id), ["gpt-old"]);
+		}, { repository: createSnapshotRepository({ directory }) });
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("changing effective credentials or losing configuration clears automatic candidates without a network fallback", async () => {
+	const net = network({ data: [{ id: "gpt-old-identity" }] });
+	await withRuntime(net.fetch, async ({ bind, registry, runtime, path, credentials }) => {
+		bind();
+		await registry.refresh({ providers: [codexId], allowNetwork: true, force: true });
+		await credentials.modify(codexId, async () => ({ type: "api_key", key: "synthetic-other-key" }));
+		await registry.refresh({ providers: [codexId], allowNetwork: false });
+		assert.deepEqual(runtime.getModels(codexId), []);
+		await credentials.delete(codexId);
+		await writeFile(path, JSON.stringify({ providers: { [codexId]: { baseUrl: config.baseUrl } } }));
+		await registry.refresh({ providers: [codexId], allowNetwork: false });
+		assert.deepEqual(runtime.getModels(codexId), []);
+		assert.equal(net.requests.length, 1);
+	});
 });
 
 test("a complete discovered catalog is native-composed with user models and overrides and restores only API facts", async () => {

@@ -1,12 +1,12 @@
 import { createProvider, envApiKeyAuth, type Api, type FetchFunction, type Model, type Provider } from "@earendil-works/pi-ai";
 import { claudeCodeStream, claudeCodeStreamSimple } from "../claude/stream.ts";
 import { codexStream, codexStreamSimple } from "../codex/stream.ts";
-import { buildModels, fetchCatalog } from "./catalog.ts";
+import { buildModels, CatalogFetchError, fetchCatalog } from "./catalog.ts";
 import type { ChameleonProviderId, DiscoveryAccess, DiscoveryClock, RelayFamily, SnapshotRepository, SnapshotState } from "./types.ts";
 
 export interface DiscoveryState {
 	provider: ChameleonProviderId;
-	status: "unconfigured" | "cache" | "empty" | "loading" | "success" | "failed" | "unsaved";
+	status: "unconfigured" | "cache" | "empty" | "loading" | "success" | "failed" | "unsaved" | "suspended" | "suspension-unsaved";
 	checkedAt?: number;
 }
 export interface DiscoveryProviderDependencies {
@@ -77,8 +77,16 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 				} catch {
 					if (current()) deps.onChange?.({ provider: id, status: "unsaved", checkedAt: snapshot.checkedAt });
 				}
-			} catch {
-				if (current()) deps.onChange?.({ provider: id, status: "failed" });
+			} catch (error) {
+				if (!current()) return;
+				if (error instanceof CatalogFetchError && (error.httpStatus === 401 || error.httpStatus === 403)) {
+					if (!await context.publish({ update: () => { saved = { ...saved, suspended: true }; models = []; } }) || !current()) return;
+					let status: DiscoveryState["status"] = "suspended";
+					try {
+						if (identity) await deps.repository.suspend(id, identity, { signal: context.signal, isCurrent: current });
+					} catch { status = "suspension-unsaved"; }
+					if (current()) deps.onChange?.({ provider: id, status, checkedAt: saved.snapshot?.checkedAt });
+				} else deps.onChange?.({ provider: id, status: "failed", checkedAt: saved.snapshot?.checkedAt });
 			}
 		},
 	};
