@@ -44,22 +44,22 @@ async function withRuntime(
 		});
 		const settings = SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off" });
 		const registry = new ModelRegistry(runtime);
+		const configured = Object.values((config as { providers?: Record<string, { baseUrl?: string; apiKey?: string }> }).providers ?? {});
+		const expectedRequests = configured.filter((provider) => provider.baseUrl && provider.apiKey).length;
+		let requests = 0;
+		let resolveReady!: () => void;
+		const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+		if (!expectedRequests) resolveReady();
 		const loader = new DefaultResourceLoader({
 			cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noThemes: true,
 			noContextFiles: true, noPromptTemplates: true,
 			extensionFactories: [createChameleonExtension({
 				repository: createSnapshotRepository({ directory: join(dir, "catalogs") }),
-				fetch: async () => Response.json({
-					data: [...CLAUDE_FIXTURE_MODELS, ...CODEX_FIXTURE_MODELS].map(({ id }) => ({ id })),
-					has_more: false,
-				}),
-			}), (pi) => {
-				// Wait until startup has been superseded by an explicitly awaited native discovery pass.
-				pi.on("session_start", async () => {
-					await new Promise<void>((resolve) => setImmediate(resolve));
-					await registry.refresh({ allowNetwork: true, force: true });
-				});
-			}],
+				fetch: async () => {
+					if (++requests === expectedRequests) resolveReady();
+					return Response.json({ data: [...CLAUDE_FIXTURE_MODELS, ...CODEX_FIXTURE_MODELS].map(({ id }) => ({ id })), has_more: false });
+				},
+			})],
 		});
 		await loader.reload();
 		assert.deepEqual(loader.getExtensions().errors, []);
@@ -67,7 +67,12 @@ async function withRuntime(
 			cwd: dir, agentDir: dir, modelRuntime: runtime, resourceLoader: loader, settingsManager: settings,
 			sessionManager: SessionManager.inMemory(dir), model: codexModel(), noTools: "all",
 		}));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await runtime.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: false });
 		await session.bindExtensions({ mode: "print" });
+		await ready;
+		// Join already-armed startup GETs instead of racing its background force with another force.
+		await registry.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: true });
 		const providers = ["chameleon-claude", "chameleon-codex"].map((id) => runtime.getRegisteredNativeProvider(id)!);
 		await run(runtime, path, credentials, providers);
 	} finally {
