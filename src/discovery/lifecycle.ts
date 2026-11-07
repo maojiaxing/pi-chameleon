@@ -150,7 +150,7 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 			// Cost provenance must survive user renames: markers can be lost in modelOverrides, so fall back to a generic warning.
 			if (event.model.name.includes("参考费用")) details.push("参考费用来自本地官方资料，仅为估算，不是中转站账单。");
 			else if (event.model.name.includes("费用未知")) details.push("费用未知，原生统计的零占位不代表免费。");
-			else details.push("费用来源未确认：本地资料仅为估算或未知，不是中转站账单。");
+			else details.push("能力可能未确认，临时客户端预算不代表上游实际限额；费用来源未确认（费用可能未知），零估算不代表免费。用户显式能力和费用覆盖优先；本地估算不是中转站账单。");
 			context.ui.notify(details.join(" "), "info");
 		});
 		pi.on("session_start", (_event, context) => {

@@ -269,6 +269,24 @@ test("a first start without cache, explicit model, or a discovered default does 
 	}
 });
 
+test("a renamed unknown candidate still warns about unconfirmed capability and zero cost placeholders", { timeout: 20_000 }, async () => {
+	const fetch: FetchFunction = async (_url, init) => Response.json(new Headers(init?.headers).has("authorization")
+		? { data: [{ id: "gpt-unknown-renamed" }] } : { data: [], has_more: false });
+	await withSession(fetch, async (h) => {
+		await h.registry.refresh({ providers: ["chameleon-codex"], allowNetwork: true });
+		const model = h.registry.find("chameleon-codex", "gpt-unknown-renamed")!;
+		assert.equal(model.name, "我的测试模型");
+		h.notifications.length = 0;
+		await h.pi.setModel(model);
+		const note = h.notifications.join(" ");
+		assert.match(note, /能力.*未确认/);
+		assert.match(note, /临时客户端预算/);
+		assert.match(note, /费用.*未知/);
+		assert.match(note, /零.*不代表免费/);
+		assert.equal(h.session.model?.name, "我的测试模型");
+	}, { providerExtras: { "chameleon-codex": { modelOverrides: { "gpt-unknown-renamed": { name: "我的测试模型" } } } } });
+});
+
 test("a user rename via modelOverrides keeps the user's name and still explains that cost is not a relay bill", { timeout: 20_000 }, async () => {
 	const fetch: FetchFunction = async (_url, init) => Response.json(new Headers(init?.headers).has("authorization")
 		? { data: [{ id: "gpt-5.3-codex" }] } : { data: [], has_more: false });
