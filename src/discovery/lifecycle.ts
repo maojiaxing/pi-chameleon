@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { FetchFunction } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createDiscoveryProvider, type DiscoveryState } from "./provider.ts";
@@ -33,9 +34,55 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 		let lifetime = new AbortController();
 		let stopped = false;
 		const states = new Map<string, DiscoveryState>();
+		let bridgeHandle: ReturnType<typeof setImmediate> | undefined;
+		let bridging = false;
+		let pending = false;
+		let absenceNotice = "";
+		async function bridge() {
+			const bound = ctx;
+			const expected = epoch;
+			if (!bound || stopped || bridging) return;
+			const current = bound.model;
+			if (!current || !families.some((family) => current.provider === `chameleon-${family}`)) { pending = false; return; }
+			const next = bound.modelRegistry.find(current.provider, current.id);
+			if (!next) {
+				pending = false;
+				const status = states.get(current.provider)?.status;
+				const notice = `${current.provider}:${current.id}:${status}`;
+				if (absenceNotice !== notice) {
+					absenceNotice = notice;
+					bound.ui.notify("Chameleon：当前模型已不在自动候选目录中或目录已停用。保留当前会话选择，不自动切换或中断请求；可自行刷新或选择，后续请求不保证成功。", "warning");
+				}
+				return;
+			}
+			absenceNotice = "";
+			if (isDeepStrictEqual(current, next)) { pending = false; return; }
+			pending = true;
+			if (!bound.isIdle()) return;
+			bridging = true;
+			try {
+				const thinking = pi.getThinkingLevel();
+				if (ctx === bound && epoch === expected && bound.isIdle() && await pi.setModel(next)) {
+					if (ctx === bound && epoch === expected) {
+						// Pi clamps the preserved level to the new capabilities; neither setter changes defaults.
+						pi.setThinkingLevel(thinking);
+						pending = false;
+					}
+				}
+			} finally { bridging = false; }
+		}
+		function scheduleBridge() {
+			if (!ctx || bridgeHandle) return;
+			const expected = epoch;
+			bridgeHandle = setImmediate(() => {
+				bridgeHandle = undefined;
+				if (ctx && epoch === expected) void bridge().catch(() => {});
+			});
+		}
 		function notify(state: DiscoveryState) {
 			states.set(state.provider, state);
 			if (!ctx) return;
+			if (state.status !== "loading") scheduleBridge();
 			const checked = state.checkedAt && Number.isFinite(state.checkedAt)
 				? ` 最近成功时间：${new Date(state.checkedAt).toISOString()}。` : "";
 			try { ctx.ui.notify(`${state.provider === "chameleon-claude" ? "Chameleon Claude" : "Chameleon Codex"}：${messages[state.status]}${checked}`,
@@ -91,9 +138,11 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 						}
 					} catch { if (ctx === bound && epoch === expected) notify({ provider: id, status: "failed" }); }
 				}));
-				if (ctx === bound && epoch === expected) missingDefault();
+				if (ctx === bound && epoch === expected) { await bridge(); missingDefault(); }
 			},
 		});
+		pi.on("agent_end", () => { if (pending) scheduleBridge(); });
+		pi.on("agent_settled", async () => { if (pending) await bridge(); });
 		pi.on("model_select", (event, context) => {
 			if (!families.some((family) => event.model.provider === `chameleon-${family}`)) return;
 			const details = ["Chameleon：所选模型是协议候选，不代表聊天已验证。"];
@@ -104,6 +153,9 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 		});
 		pi.on("session_start", (_event, context) => {
 			epoch++;
+			if (bridgeHandle) clearImmediate(bridgeHandle);
+			bridgeHandle = undefined;
+			pending = false;
 			lifetime.abort();
 			lifetime = new AbortController();
 			ctx = context;
@@ -115,14 +167,17 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 			const expected = epoch;
 			// Startup/reload never waits for network. The public refresh remains a completion barrier for callers.
 			void context.modelRegistry.refresh({ providers: families.map((family) => `chameleon-${family}`),
-				allowNetwork: !process.env.PI_OFFLINE, force: true, signal: lifetime.signal }).then(() => {
-				if (ctx === context && epoch === expected) missingDefault();
+				allowNetwork: !process.env.PI_OFFLINE, force: true, signal: lifetime.signal }).then(async () => {
+				if (ctx === context && epoch === expected) { await bridge(); missingDefault(); }
 			}).catch(() => {
 				if (ctx === context && epoch === expected) notify({ provider: "chameleon-codex", status: "failed" });
 			});
 		});
 		pi.on("session_shutdown", () => {
 			epoch++;
+			if (bridgeHandle) clearImmediate(bridgeHandle);
+			bridgeHandle = undefined;
+			pending = false;
 			ctx = undefined;
 			lifetime.abort();
 			for (const discovery of providers) discovery.dispose();
