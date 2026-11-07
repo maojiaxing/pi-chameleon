@@ -3,8 +3,56 @@ import { Type } from "typebox";
 import {
 	normalizeContext, type FetchFunction, type Model, type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { CLAUDE_MODELS } from "../src/claude/models.ts";
-import { CODEX_MODELS } from "../src/codex/models.ts";
+// Fixed chat regression inputs are test-only. Discovery never uses this membership or capability data.
+const CLAUDE_FIXTURE_COMPAT = {
+	supportsMidConvoSystemMessages: true, supportsMidConvoEffort: false, supportsMidConvoToolChanges: false,
+	supportsStrictTools: false, supportsEagerToolInputStreaming: false,
+};
+export const CLAUDE_FIXTURE_MODELS: Omit<Model<"anthropic-messages">, "api" | "provider" | "baseUrl">[] = [
+	{
+		type: "chat", id: "claude-opus-5-5", name: "Claude Opus 5.5 (chameleon)", reasoning: true, input: ["text", "image"],
+		cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 }, contextWindow: 1_000_000, maxTokens: 128_000,
+		compat: { forceAdaptiveThinking: true, supportsTemperature: false, ...CLAUDE_FIXTURE_COMPAT },
+		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+	},
+	{
+		type: "chat", id: "claude-opus-4-6", name: "Claude Opus 4.6 (chameleon)", reasoning: true, input: ["text", "image"],
+		cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }, contextWindow: 1_000_000, maxTokens: 128_000,
+		compat: { forceAdaptiveThinking: true, ...CLAUDE_FIXTURE_COMPAT }, thinkingLevelMap: { max: "max" },
+	},
+	{
+		type: "chat", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (chameleon)", reasoning: true, input: ["text", "image"],
+		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 1_000_000, maxTokens: 128_000,
+		compat: { forceAdaptiveThinking: true, ...CLAUDE_FIXTURE_COMPAT }, thinkingLevelMap: { max: "max" },
+	},
+];
+const CODEX_FIXTURE_THINKING = {
+	off: "none", minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null,
+};
+export const CODEX_FIXTURE_MODELS: Omit<Model<"openai-responses">, "api" | "provider" | "baseUrl">[] = [
+	{
+		type: "chat", id: "gpt-5.3-codex", name: "GPT-5.3 Codex (chameleon)", reasoning: true, input: ["text", "image"],
+		cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 }, contextWindow: 400_000, maxTokens: 128_000,
+		compat: { supportsStrictMode: true, supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: true },
+		thinkingLevelMap: { ...CODEX_FIXTURE_THINKING },
+	},
+	{
+		type: "chat", id: "gpt-5.4", name: "GPT-5.4 (chameleon)", reasoning: true, input: ["text", "image"],
+		cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0,
+			tiers: [{ inputTokensAbove: 272_000, input: 5, output: 22.5, cacheRead: 0.5, cacheWrite: 0 }] },
+		contextWindow: 272_000, maxTokens: 128_000,
+		compat: { supportsStrictMode: true, supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: true },
+		thinkingLevelMap: { ...CODEX_FIXTURE_THINKING },
+	},
+	{
+		type: "chat", id: "gpt-5.5", name: "GPT-5.5 (chameleon)", reasoning: true, input: ["text", "image"],
+		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0,
+			tiers: [{ inputTokensAbove: 272_000, input: 10, output: 45, cacheRead: 1, cacheWrite: 0 }] },
+		contextWindow: 272_000, maxTokens: 128_000,
+		compat: { supportsStrictMode: true, supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: true },
+		thinkingLevelMap: { ...CODEX_FIXTURE_THINKING },
+	},
+];
 
 export const API_KEY = "offline-test-key";
 export const SESSION_ID = "11111111-2222-4333-8444-555555555555";
@@ -29,12 +77,12 @@ export function array(value: unknown): unknown[] {
 }
 
 export function claudeModel(id = "claude-opus-5-5"): Model<"anthropic-messages"> {
-	const configured = CLAUDE_MODELS.find((entry) => entry.id === id);
+	const configured = CLAUDE_FIXTURE_MODELS.find((entry) => entry.id === id);
 	assert.ok(configured);
 	return { ...configured, api: "anthropic-messages", provider: "chameleon-claude", baseUrl: BASE_URL };
 }
 export function codexModel(id = "gpt-5.3-codex"): Model<"openai-responses"> {
-	const configured = CODEX_MODELS.find((entry) => entry.id === id);
+	const configured = CODEX_FIXTURE_MODELS.find((entry) => entry.id === id);
 	assert.ok(configured);
 	return { ...configured, api: "openai-responses", provider: "chameleon-codex", baseUrl: `${BASE_URL}/v1` };
 }
@@ -97,7 +145,8 @@ export function capture(response: () => Response): { requests: CapturedRequest[]
 	const requests: CapturedRequest[] = [];
 	const fetch: FetchFunction = async (input, init) => {
 		const request = new Request(input, init);
-		requests.push({ url: request.url, headers: request.headers, redirect: request.redirect, body: object(JSON.parse(await request.text())) });
+		const text = await request.text();
+		requests.push({ url: request.url, headers: request.headers, redirect: request.redirect, body: text ? object(JSON.parse(text)) : {} });
 		return response();
 	};
 	return { requests, fetch };
