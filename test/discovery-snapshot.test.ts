@@ -109,6 +109,36 @@ test("identity tracks effective access semantics but never leaks the raw credent
 	});
 });
 
+test("identity uses final case-insensitive header replacements and null deletions", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const canonical = await repository.identity({ ...access, headers: { "x-tenant": "final" } });
+		assert.equal(await repository.identity({ ...access, headers: {
+			"X-Tenant": "discarded", "x-tenant": "  final  ", "X-Removed": "discarded", "x-removed": null,
+		} }), canonical);
+		assert.equal(await repository.identity({ ...access, headers: { "X-Removed": null } }),
+			await repository.identity({ ...access, headers: {} }));
+	});
+});
+
+test("identity rejects every inadmissible endpoint rather than reusing a valid catalog", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		for (const baseUrl of [
+			`${access.baseUrl}#SYNTHETIC_FRAGMENT`, `${access.baseUrl}?key=SYNTHETIC_QUERY`,
+			"https://SYNTHETIC_USER:SYNTHETIC_PASSWORD@synthetic-relay.invalid/v1",
+			"ftp://synthetic-relay.invalid/v1", "file:///SYNTHETIC_PATH", "not a URL",
+		]) {
+			await assert.rejects(repository.identity({ ...access, baseUrl }), {
+				code: "SNAPSHOT_IDENTITY_FAILED", message: "SNAPSHOT_IDENTITY_FAILED",
+			});
+		}
+		assert.deepEqual(await repository.read(claude, identity), { snapshot: first, suspended: false });
+	});
+});
+
 test("each provider keeps its own single snapshot and never imports another identity", async () => {
 	await withDirectory(async (directory) => {
 		const repository = createSnapshotRepository({ directory });
@@ -158,6 +188,40 @@ test("untrusted, old, oversized, or malformed persisted envelopes are unavailabl
 		assert.deepEqual(await repository.read(claude, ""), { suspended: false }, "an unconfirmed identity cannot restore");
 		await rm(file);
 		assert.deepEqual(await repository.read(claude, identity), { suspended: false });
+	});
+});
+
+test("cleanup cannot report a committed catalog as failed", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		const replacement: CatalogSnapshot = { checkedAt: first.checkedAt + 9, records: [{ id: "committed" }] };
+		const faulty = createSnapshotRepository({ directory, io: {
+			unlink: async () => { throw new Error("SYNTHETIC_CLEANUP_SECRET"); },
+		} });
+		await faulty.saveSuccess(claude, identity, replacement);
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: replacement, suspended: false });
+	});
+});
+
+test("cleanup preserves the primary cancellation and the preceding catalog", async () => {
+	await withDirectory(async (directory) => {
+		const repository = createSnapshotRepository({ directory });
+		const identity = await repository.identity(access);
+		await repository.saveSuccess(claude, identity, first);
+		const controller = new AbortController();
+		const faulty = createSnapshotRepository({ directory, io: {
+			writeFile: async (path, bytes, options) => {
+				await writeFile(path, bytes, options);
+				controller.abort("SYNTHETIC_CANCEL_SECRET");
+			},
+			unlink: async () => { throw new Error("SYNTHETIC_CLEANUP_SECRET"); },
+		} });
+		await assert.rejects(faulty.saveSuccess(claude, identity, { checkedAt: first.checkedAt + 10, records: [] }, { signal: controller.signal }), {
+			code: "SNAPSHOT_CANCELLED", message: "SNAPSHOT_CANCELLED",
+		});
+		assert.deepEqual(await createSnapshotRepository({ directory }).read(claude, identity), { snapshot: first, suspended: false });
 	});
 });
 
@@ -307,7 +371,8 @@ test("every public error contains only a safe code, even when inputs or storage 
 		const failedCleanup = createSnapshotRepository({ directory, io: {
 			unlink: async () => { throw null; },
 		} });
-		await assert.rejects(failedCleanup.saveSuccess(claude, identity, first), { code: "SNAPSHOT_WRITE_FAILED", message: "SNAPSHOT_WRITE_FAILED" });
+		await failedCleanup.saveSuccess(claude, identity, first);
+		assert.deepEqual(await repository.read(claude, identity), { snapshot: first, suspended: false });
 	});
 });
 

@@ -253,6 +253,18 @@ function modelCompat(family: RelayFamily, reference: CatalogRecord["compat"], fa
 	return Object.keys(compat).length ? compat : undefined;
 }
 
+function modelThinking(reference: CatalogRecord["thinkingLevelMap"], facts: CatalogRecord["thinkingLevelMap"]): CatalogRecord["thinkingLevelMap"] {
+	const map: NonNullable<CatalogRecord["thinkingLevelMap"]> = {};
+	for (const source of [reference, facts]) {
+		if (!object(source)) continue;
+		for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+			const effort = source[level];
+			if (effort === null || (typeof effort === "string" && /^[a-z0-9_-]{1,64}$/i.test(effort))) map[level] = effort;
+		}
+	}
+	return Object.keys(map).length ? map : undefined;
+}
+
 /** Pi composes user models and overrides above these discovery facts. */
 export function buildModels(
 	family: RelayFamily, accessBaseUrl: string, records: readonly CatalogRecord[],
@@ -262,13 +274,14 @@ export function buildModels(
 	return records.map((record) => {
 		const reference = builtin.find((model) => model.id === record.id && model.api === api);
 		const contextWindow = record.contextWindow ?? reference?.contextWindow ?? 32_768;
-		const maxTokens = record.maxTokens ?? reference?.maxTokens ?? Math.min(4_096, contextWindow);
+		const maxTokens = Math.min(record.maxTokens ?? reference?.maxTokens ?? 4_096, contextWindow);
 		const input = record.input ?? reference?.input;
 		const reasoning = record.reasoning ?? reference?.reasoning;
 		const unknown = (record.contextWindow ?? reference?.contextWindow) === undefined
 			|| (record.maxTokens ?? reference?.maxTokens) === undefined || input === undefined || reasoning === undefined;
 		const { cost, source } = modelCost(record.cost, reference?.cost);
 		const compat = modelCompat(family, reference?.compat, record.compat);
+		const thinkingLevelMap = modelThinking(reference?.thinkingLevelMap, record.thinkingLevelMap);
 		const labels = [unknown ? "能力未确认" : "", source === "reference" ? "参考费用" : source === "unknown" ? "费用未知，不代表免费" : ""].filter(Boolean);
 		return {
 			id: record.id,
@@ -281,7 +294,7 @@ export function buildModels(
 			input: input ? [...input] : ["text"],
 			reasoning: reasoning ?? false,
 			cost,
-			...(reference?.thinkingLevelMap ? { thinkingLevelMap: { ...reference.thinkingLevelMap } } : {}),
+			...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 			...(compat ? { compat } : {}),
 		};
 	});

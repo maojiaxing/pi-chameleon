@@ -210,12 +210,18 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 	const file = (provider: ChameleonProviderId) => join(options.directory, `${provider}.json`);
 	async function identity(access: DiscoveryAccess): Promise<string> {
 		try {
-			const key = await localIdentityKey(options.directory, io);
 			const url = new URL(access.baseUrl);
-			url.hash = "";
+			if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) {
+				throw new SnapshotRepositoryError("SNAPSHOT_IDENTITY_FAILED");
+			}
+			const key = await localIdentityKey(options.directory, io);
 			const baseUrl = url.toString().replace(/\/+$/, "");
-			const headers = Object.entries(access.headers ?? {}).map(([name, value]) => [name.toLowerCase(), value])
-				.sort(([left], [right]) => String(left).localeCompare(String(right)));
+			const effective = new Headers();
+			for (const [name, value] of Object.entries(access.headers ?? {})) {
+				if (value === null) effective.delete(name);
+				else effective.set(name, value);
+			}
+			const headers = [...effective.entries()].sort(([left], [right]) => left.localeCompare(right));
 			return createHmac("sha256", key).update(JSON.stringify([baseUrl, access.apiKey ?? null, headers])).digest("hex");
 		} catch {
 			throw new SnapshotRepositoryError("SNAPSHOT_IDENTITY_FAILED");
@@ -256,8 +262,8 @@ export function createSnapshotRepository(options: SnapshotRepositoryOptions): Sn
 		} finally {
 			try {
 				await io.unlink(temporary);
-			} catch (error) {
-				if (!hasCode(error, "ENOENT")) throw new SnapshotRepositoryError("SNAPSHOT_WRITE_FAILED");
+			} catch {
+				// The rename or primary failure determines the outcome, not best-effort cleanup.
 			}
 		}
 	}
