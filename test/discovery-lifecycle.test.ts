@@ -71,11 +71,18 @@ async function withSession(fetch: FetchFunction, run: (h: {
 		const settings = SettingsManager.inMemory(options.settings ?? { defaultProvider: "chameleon-codex", defaultModel: "explicit-session" });
 		const registry = new ModelRegistry(runtime);
 		let pi!: ExtensionAPI;
+		const startupRequests = new Set<string>();
+		const startupArmed = deferred<void>();
+		const observedFetch: FetchFunction = (input, init) => {
+			startupRequests.add(new Headers(init?.headers).has("authorization") ? "codex" : "claude");
+			if (startupRequests.size === 2) startupArmed.resolve();
+			return fetch(input, init);
+		};
 		const loader = new DefaultResourceLoader({
 			cwd: directory, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noThemes: true,
 			noPromptTemplates: true, noContextFiles: true,
 			extensionFactories: [{ name: "chameleon-test", factory: createChameleonExtension({
-				fetch, repository: createSnapshotRepository({ directory: join(directory, "catalogs") }),
+				fetch: observedFetch, repository: createSnapshotRepository({ directory: join(directory, "catalogs") }),
 			}) }, { name: "public-test-observer", factory(api) { pi = api; } }],
 		});
 		await loader.reload();
@@ -85,8 +92,14 @@ async function withSession(fetch: FetchFunction, run: (h: {
 			settingsManager: settings, sessionManager: SessionManager.inMemory(directory), model: explicit, noTools: "all",
 		});
 		session = created.session;
+		// Native registration queues cache-only refreshes. Let them enter, then await the public initialization barrier.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await runtime.refresh({ providers: ["chameleon-codex", "chameleon-claude"], allowNetwork: false });
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		const notifications: string[] = [];
 		await session.bindExtensions({ uiContext: { notify(message) { notifications.push(message); } } as ExtensionUIContext, mode: "print" });
+		// Wait for external startup GETs to be armed, not completed, before a test starts an ordinary host refresh.
+		if (process.env.PI_OFFLINE === undefined) await startupArmed.promise;
 		await run({ session, registry, notifications, pi, loader });
 	} finally {
 		if (session) {

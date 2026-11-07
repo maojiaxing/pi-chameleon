@@ -165,12 +165,21 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 				stopped = false;
 			}
 			const expected = epoch;
-			// Startup/reload never waits for network. The public refresh remains a completion barrier for callers.
-			void context.modelRegistry.refresh({ providers: families.map((family) => `chameleon-${family}`),
-				allowNetwork: process.env.PI_OFFLINE === undefined, force: true, signal: lifetime.signal }).then(async () => {
-				if (ctx === context && epoch === expected) { await bridge(); missingDefault(); }
-			}).catch(() => {
-				if (ctx === context && epoch === expected) notify({ provider: "chameleon-codex", status: "failed" });
+			const signal = lifetime.signal;
+			const current = () => ctx === context && epoch === expected && !signal.aborted;
+			// Registration refreshes are fire-and-forget. Preserve startup intent behind a public cache barrier.
+			async function startup() {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				if (!current()) return;
+				const ids = families.map((family) => `chameleon-${family}`);
+				await context.modelRegistry.refresh({ providers: ids, allowNetwork: false, signal });
+				if (!current()) return;
+				await context.modelRegistry.refresh({ providers: ids, allowNetwork: process.env.PI_OFFLINE === undefined, force: true, signal });
+				if (current()) { await bridge(); missingDefault(); }
+			}
+			// Neither session_start nor reload is a network completion barrier. HTTP failures are never retried here.
+			void startup().catch(() => {
+				if (current()) notify({ provider: "chameleon-codex", status: "failed" });
 			});
 		});
 		pi.on("session_shutdown", () => {

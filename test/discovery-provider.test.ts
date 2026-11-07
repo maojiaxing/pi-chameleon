@@ -217,7 +217,7 @@ test("ordinary model refresh obeys the one-hour successful freshness gate and fo
 	}, { clock: time.value });
 });
 
-test("ordinary native refreshes share one in-flight request even when Pi supersedes and aborts the old waiter", async () => {
+test("a cache-only refresh adopts the existing shared request after Pi supersedes and aborts the old network waiter", async () => {
 	const started = deferred<void>();
 	const release = deferred<Response>();
 	let requests = 0;
@@ -232,7 +232,8 @@ test("ordinary native refreshes share one in-flight request even when Pi superse
 		bind();
 		const first = registry.refresh({ providers: [codexId], allowNetwork: true });
 		await started.promise;
-		const second = registry.refresh({ providers: [codexId], allowNetwork: true });
+		// An already-started network job may be joined by a later cache-only phase; it must not start another GET.
+		const second = registry.refresh({ providers: [codexId], allowNetwork: false });
 		await first;
 		assert.equal(requestSignal?.aborted, false, "an old native waiter must not cancel the shared transport");
 		release.resolve(Response.json({ data: [{ id: "gpt-shared" }] }));

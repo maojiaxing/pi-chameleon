@@ -88,7 +88,9 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 				if (!current()) return;
 				// Never reload a same-identity disk copy over a newer in-memory success.
 				emit(saved.suspended ? "suspended" : unsaved ? "unsaved" : saved.snapshot ? "cache" : "empty");
-				if (!context.allowNetwork || process.env.PI_OFFLINE !== undefined) return;
+				if (process.env.PI_OFFLINE !== undefined) return;
+				// Cache-only never initiates network, but its newest native context can publish an existing job.
+				if (!context.allowNetwork && !job) return;
 				if (!context.force && !job && !saved.suspended && saved.snapshot && now() - saved.snapshot.checkedAt < 3_600_000) return;
 				if (context.force) cancelJob();
 				if (!job) {
