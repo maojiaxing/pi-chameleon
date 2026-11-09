@@ -1,4 +1,5 @@
 // /compat is explicitly supported by the real Pi extension loader.
+import { randomUUID } from "node:crypto";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
 import type { Api, Model, SimpleStreamOptions, StreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { prepareRelayRequest } from "../relay-transport.ts";
@@ -17,7 +18,10 @@ function streamClaude(
 	if (options && "client" in options && options.client !== undefined) {
 		throw new Error("pi-chameleon uses fetch injection, not a custom Anthropic client");
 	}
-	const request = prepareRelayRequest(CLAUDE_PROFILE, model, options);
+	const requestOptions = options?.sessionId === undefined
+		? { ...options, sessionId: randomUUID() }
+		: options;
+	const request = prepareRelayRequest(CLAUDE_PROFILE, model, requestOptions);
 	// Select the native non-strict serializer while preserving native thinking decisions.
 	const wireModel = {
 		...request.model,

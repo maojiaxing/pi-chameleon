@@ -10,6 +10,7 @@ export interface RelayProfile<TApi extends Api> {
 	rewriteUrl?(url: URL): void;
 	protectedHeaders?: readonly string[];
 	finalizeHeaders?(headers: ProviderHeaders): void;
+	finalizeBody?(payload: unknown, sessionId: string): unknown;
 	omitHeader?(name: string): boolean;
 }
 
@@ -98,6 +99,18 @@ function relayFetch<TApi extends Api>(
 		for (const [name, value] of new Headers(init?.headers)) inherited.set(name, value);
 		const enforced = requestHeaders(profile, sessionId, apiKey, headers, Object.fromEntries(inherited));
 		profile.finalizeHeaders?.(enforced);
+		let finalizedBody: string | undefined;
+		if (profile.finalizeBody) {
+			const body = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
+			if (typeof body !== "string") throw new Error("pi-chameleon request body cannot be safely normalized");
+			let payload: unknown;
+			try {
+				payload = JSON.parse(body);
+			} catch {
+				throw new Error("pi-chameleon request body cannot be safely normalized");
+			}
+			finalizedBody = JSON.stringify(profile.finalizeBody(payload, sessionId));
+		}
 		const outgoing = new Headers();
 		for (const [name, value] of Object.entries(enforced)) {
 			if (value !== null) outgoing.set(name, value);
@@ -105,7 +118,7 @@ function relayFetch<TApi extends Api>(
 		const routed = url.toString() === originalUrl ? input
 			: input instanceof Request ? new Request(url, input)
 				: typeof input === "string" ? url.toString() : url;
-		return transport(routed, { ...init, headers: outgoing, redirect: "error" });
+		return transport(routed, { ...init, ...(finalizedBody === undefined ? {} : { body: finalizedBody }), headers: outgoing, redirect: "error" });
 	};
 }
 
