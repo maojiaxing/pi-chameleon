@@ -2,7 +2,6 @@ import { isDeepStrictEqual } from "node:util";
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { finalizeClaudePayload } from "./identity.ts";
 import { resolveClaudeCachePolicy, type ClaudeCachePolicy } from "./cache-policy.ts";
-import { DEVICE_ID } from "../identity.ts";
 import { claudeCodePrompt } from "./prompts.ts";
 import { wireToolNamesDeep } from "./tools.ts";
 
@@ -76,16 +75,7 @@ function compatiblePayload(payload: unknown, sessionId: string): { payload: unkn
 		messages,
 		tools: payload.tools ?? [],
 	}, fromWire);
-	return {
-		payload: {
-			...(wired as Record<string, unknown>),
-			metadata: {
-				...(isRecord(payload.metadata) ? payload.metadata : {}),
-				user_id: JSON.stringify({ device_id: DEVICE_ID, account_uuid: "", session_id: sessionId }),
-			},
-		},
-		fromWire,
-	};
+	return { payload: finalizeClaudePayload(wired, sessionId), fromWire };
 }
 
 const NO_CACHE: ClaudeCachePolicy = { retention: "none", control: undefined, tools: false };
@@ -97,7 +87,7 @@ function protectedView(payload: unknown): Record<string, unknown> {
 }
 function validateHook(before: Record<string, unknown>, after: unknown): void {
 	const value = protectedView(after);
-	for (const field of ["model", "system", "tools", "tool_choice", "permissions"]) {
+	for (const field of ["model", "system", "tools", "tool_choice", "permissions", "thinking", "output_config", "context_management"]) {
 		if (!isDeepStrictEqual(value[field], before[field])) throw new Error("Claude hook changed a protected payload field");
 	}
 	const original = before.messages as unknown[];

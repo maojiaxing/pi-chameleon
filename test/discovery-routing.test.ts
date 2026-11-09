@@ -9,7 +9,7 @@ import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createDiscoveryProvider } from "../src/discovery/provider.ts";
 import { createSnapshotRepository } from "../src/discovery/snapshot.ts";
 import type { RelayFamily } from "../src/discovery/types.ts";
-import { array, capture, claudeTextResponse, codexTextResponse, context, object, CLAUDE_BETAS } from "./fixtures.ts";
+import { array, capture, claudeTextResponse, codexTextResponse, context, object } from "./fixtures.ts";
 
 const originalClaude = getApiProvider("anthropic-messages")!;
 const originalCodex = getApiProvider("openai-responses")!;

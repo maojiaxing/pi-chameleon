@@ -4,7 +4,7 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { claudeCodeStream, claudeCodeStreamSimple } from "../src/claude/stream.ts";
 import {
  API_KEY, SESSION_ID, BASE_URL, CLAUDE_IDENTITY as CLAUDE_CODE_IDENTITY,
- CLAUDE_BETAS as CLAUDE_CODE_BETAS, claudeModel as model, context, sse,
+ claudeModel as model, context, sse,
  claudeStart as start, claudeTextResponse as textResponse, capture, object, array,
 } from "./fixtures.ts";
 

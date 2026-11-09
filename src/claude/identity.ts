@@ -14,10 +14,6 @@ export const CLAUDE_SERIALIZER_COMPAT = {
 
 export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 export const EPHEMERAL = { type: "ephemeral" } as const;
-export const CONTEXT_MANAGEMENT = {
-	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
-} as const;
-export const THINKING = { type: "adaptive", display: "updates" } as const;
 
 const CONTEXT_BETA = "context-1m-2025-08-07";
 
