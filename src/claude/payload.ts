@@ -1,5 +1,5 @@
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { EPHEMERAL } from "./identity.ts";
+import { EPHEMERAL, finalizeClaudePayload } from "./identity.ts";
 import { DEVICE_ID } from "../identity.ts";
 import { claudeCodePrompt } from "./prompts.ts";
 import { wireToolNamesDeep } from "./tools.ts";
@@ -81,7 +81,7 @@ export function claudePayloadAdapter(sessionId: string, hook?: SimpleStreamOptio
 			const adapted = compatiblePayload(payload, sessionId);
 			names = adapted.fromWire;
 			const prepared = alignCacheBreakpoints(adapted.payload);
-			return alignCacheBreakpoints((await hook?.(prepared, model)) ?? prepared);
+			return finalizeClaudePayload(alignCacheBreakpoints((await hook?.(prepared, model)) ?? prepared), sessionId);
 		},
 	};
 }

@@ -174,20 +174,68 @@ test("adaptive-off and caller output caps are not forced to captured max values"
 	assert.equal("output_config" in mock.requests[0].body, false);
 });
 
-test("session IDs remain stable without adding trace headers", async () => {
+test("anonymous calls receive independent session IDs without adding trace headers", async () => {
 	const mock = capture(textResponse);
 	for (let i = 0; i < 2; i++) {
 		const result = await claudeCodeStreamSimple(model(), context(), { apiKey: API_KEY, fetch: mock.fetch }).result();
 		assert.equal(result.stopReason, "stop");
 	}
 	const [first, second] = mock.requests;
-	assert.equal(first.headers.get("x-claude-code-session-id"), second.headers.get("x-claude-code-session-id"));
+	const firstSession = first.headers.get("x-claude-code-session-id");
+	const secondSession = second.headers.get("x-claude-code-session-id");
+	assert.match(firstSession ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+	assert.match(secondSession ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+	assert.notEqual(firstSession, secondSession);
 	assert.equal(first.headers.get("x-trace-id"), null);
 	assert.equal(second.headers.get("x-trace-id"), null);
 	const firstMetadata = object(JSON.parse(String(object(first.body.metadata).user_id)));
-	assert.equal(firstMetadata.session_id, first.headers.get("x-claude-code-session-id"));
+	const secondMetadata = object(JSON.parse(String(object(second.body.metadata).user_id)));
+	assert.equal(firstMetadata.session_id, firstSession);
+	assert.equal(secondMetadata.session_id, secondSession);
+});
+test("hook metadata cannot override Claude identity but preserves unrelated metadata", async () => {
+	const mock = capture(textResponse);
+	const result = await claudeCodeStreamSimple(model(), context(), {
+		apiKey: API_KEY, sessionId: SESSION_ID, fetch: mock.fetch,
+		onPayload: (payload) => ({
+			...object(payload),
+			metadata: { trace_id: "kept", user_id: JSON.stringify({ session_id: "hook", device_id: "hook", account_uuid: "hook", extra: "keep" }) },
+		}),
+	}).result();
+	assert.equal(result.stopReason, "stop", result.errorMessage);
+	const request = mock.requests[0];
+	const metadata = object(request.body.metadata);
+	assert.equal(metadata.trace_id, "kept");
+	const userId = object(JSON.parse(String(metadata.user_id)));
+	assert.equal(userId.session_id, SESSION_ID);
+	assert.match(String(userId.device_id), /^[a-f0-9]{64}$/);
+	assert.equal(userId.account_uuid, "");
+	assert.equal(userId.extra, "keep");
 });
 
+test("malformed Claude metadata is rejected before fetch", async () => {
+	const mock = capture(textResponse);
+	const stream = claudeCodeStreamSimple(model(), context(), {
+		apiKey: API_KEY, fetch: mock.fetch,
+		onPayload: (payload) => ({ ...object(payload), metadata: "unsafe" }),
+	});
+	const result = await stream.result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage ?? "", /metadata/i);
+	assert.equal(mock.requests.length, 0);
+});
+
+
+test("malformed Claude metadata.user_id is rejected clearly before fetch", async () => {
+	const mock = capture(textResponse);
+	const result = await claudeCodeStreamSimple(model(), context(), {
+		apiKey: API_KEY, fetch: mock.fetch,
+		onPayload: (payload) => ({ ...object(payload), metadata: { user_id: "not-json" } }),
+	}).result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage ?? "", /metadata\.user_id cannot be safely normalized/);
+	assert.equal(mock.requests.length, 0);
+});
 
 for (const [label, run] of [
 	["simple", claudeCodeStreamSimple],
@@ -219,6 +267,16 @@ test("native Beta order is retained before the missing context default", { timeo
 	assert.equal(result.stopReason, "stop", result.errorMessage);
 	const beta = mock.requests[0].headers.get("anthropic-beta") ?? "";
 	assert.match(beta, /^fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07$/);
+});
+
+test("reasoning keeps native interleaved-thinking Beta and appends context default at final fetch", { timeout: 10_000 }, async () => {
+	const mock = capture(textResponse);
+	const eligibleModel = { ...model(), compat: { ...model().compat, forceAdaptiveThinking: false } };
+	const options = { apiKey: API_KEY, thinkingEnabled: true, effort: "high", fetch: mock.fetch };
+	const result = await claudeCodeStream(eligibleModel, context(), options).result();
+	assert.equal(result.stopReason, "stop", result.errorMessage);
+	const beta = mock.requests[0].headers.get("anthropic-beta") ?? "";
+	assert.equal(beta, "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,context-1m-2025-08-07");
 });
 
 test("a relay key with OAuth-like text still uses x-api-key only", { timeout: 10_000 }, async () => {

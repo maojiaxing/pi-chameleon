@@ -1,3 +1,4 @@
+import { DEVICE_ID } from "../identity.ts";
 import type { RelayProfile } from "../relay-transport.ts";
 
 /** The approved Claude Code request identity. */
@@ -19,6 +20,35 @@ export const CONTEXT_MANAGEMENT = {
 export const THINKING = { type: "adaptive", display: "updates" } as const;
 
 const CONTEXT_BETA = "context-1m-2025-08-07";
+
+export function finalizeClaudePayload(payload: unknown, sessionId: string): unknown {
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+		throw new Error("Claude request metadata cannot be safely normalized");
+	}
+	const body = payload as Record<string, unknown>;
+	const rawMetadata = body.metadata;
+	if (rawMetadata !== undefined && (typeof rawMetadata !== "object" || rawMetadata === null || Array.isArray(rawMetadata))) {
+		throw new Error("Claude request metadata cannot be safely normalized");
+	}
+	const metadata = (rawMetadata ?? {}) as Record<string, unknown>;
+	let userId: Record<string, unknown> = {};
+	if (metadata.user_id !== undefined) {
+		try {
+			const parsed = typeof metadata.user_id === "string" ? JSON.parse(metadata.user_id) : metadata.user_id;
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+			userId = parsed as Record<string, unknown>;
+		} catch {
+			throw new Error("Claude request metadata.user_id cannot be safely normalized");
+		}
+	}
+	return {
+		...body,
+		metadata: {
+			...metadata,
+			user_id: JSON.stringify({ ...userId, device_id: DEVICE_ID, account_uuid: "", session_id: sessionId }),
+		},
+	};
+}
 
 function appendMissingContextBeta(headers: Record<string, string | null>): void {
 	const native = headers["anthropic-beta"];
@@ -45,4 +75,5 @@ export const CLAUDE_PROFILE: RelayProfile<"anthropic-messages"> = {
 		};
 	},
 	finalizeHeaders: appendMissingContextBeta,
+	finalizeBody: finalizeClaudePayload,
 };
