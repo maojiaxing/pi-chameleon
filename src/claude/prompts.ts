@@ -65,9 +65,11 @@ function textBlocks(value: unknown): SystemTextBlock[] {
 	});
 }
 function onlyText(message: unknown, role: string): string | undefined {
-	if (!isRecord(message) || message.role !== role || !Array.isArray(message.content) || message.content.length !== 1) return undefined;
+	if (!isRecord(message) || message.role !== role || Object.keys(message).some((key) => !["role", "content"].includes(key)) ||
+		!Array.isArray(message.content) || message.content.length !== 1) return undefined;
 	const block = message.content[0];
-	return isRecord(block) && block.type === "text" && typeof block.text === "string" ? block.text : undefined;
+	return isRecord(block) && block.type === "text" && typeof block.text === "string" &&
+		Object.keys(block).every((key) => ["type", "text"].includes(key)) ? block.text : undefined;
 }
 
 /**

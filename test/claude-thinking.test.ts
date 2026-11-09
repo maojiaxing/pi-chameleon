@@ -95,6 +95,34 @@ test("an adaptive default does not enable reasoning that the caller or model dis
 	}
 });
 
+test("hooks cannot change native reasoning, effort, or context semantics", async (t) => {
+	for (const compat of [undefined, { forceAdaptiveThinking: false }]) {
+		for (const reasoning of [true, false]) {
+			for (const simple of [false, true]) {
+				for (const [field, injection] of Object.entries({
+					thinking: { type: "adaptive" },
+					output_config: { effort: "max" },
+					context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
+				})) {
+					await t.test(`${simple ? "simple" : "raw"}/${compat ? "false" : "missing"}/reasoning=${reasoning}/${field}`, async () => {
+						const mock = capture(claudeTextResponse);
+						const run = simple ? claudeCodeStreamSimple : claudeCodeStream;
+						const options = {
+							apiKey: "synthetic-offline-key", reasoning: "high" as const, thinkingEnabled: true,
+							fetch: mock.fetch,
+							onPayload: (payload: unknown) => { object(payload)[field] = injection; },
+						};
+						const result = await run({ ...configuredModel, compat, reasoning }, conversation, options).result();
+						assert.equal(result.stopReason, "error");
+						assert.match(result.errorMessage ?? "", /Claude hook changed a protected payload field/);
+						assert.equal(mock.requests.length, 0, "invalid semantics must fail before fetch");
+					});
+				}
+			}
+		}
+	}
+});
+
 test("explicit adaptive metadata and native thinking maps work for arbitrary relay IDs", { timeout: 5_000 }, async () => {
 	const mock = capture(claudeTextResponse);
 	const result = await claudeCodeStreamSimple({

@@ -81,7 +81,7 @@ test("old appended Runtime prefix unwraps into a single first system message", (
 
 test("only this project's exact prior billing/ACK envelope is migrated, not arbitrary user history", () => {
 	const current = claudeCodePrompt({});
-	const core = current.system[1].text.split("\n\n# Runtime instructions\n")[0];
+	const core = current.system[1].text.split("\n# Runtime instructions\n")[0].trimEnd();
 	const runtime = "Keep all Pi instructions.";
 	const source = {
 		system: [
@@ -147,7 +147,7 @@ test("equal initial and history system instructions keep both occurrences and th
 
 test("near legacy ACK templates preserve the complete original system and conversation", () => {
 	const current = claudeCodePrompt({});
-	const core = current.system[1].text.split("\n\n# Runtime instructions\n")[0];
+	const core = current.system[1].text.split("\n# Runtime instructions\n")[0].trimEnd();
 	const source = {
 		system: [
 			{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli;" },
@@ -168,6 +168,43 @@ test("near legacy ACK templates preserve the complete original system and conver
 	assert.deepEqual(result.messages.slice(1), source.messages);
 	assert.deepEqual(claudeCodePrompt(result), result);
 	assert.deepEqual(source, before);
+});
+
+test("legacy prefaces with extra message or text-block fields preserve the complete envelope", async (t) => {
+	const core = claudeCodePrompt({}).system[1].text.split("\n# Runtime instructions\n")[0].trimEnd();
+	for (const role of ["user", "assistant"]) {
+		for (const target of ["message", "block"]) {
+			for (const [field, value] of Object.entries({
+				citations: [{ type: "char_location", cited_text: "Keep permissions.", start_char_index: 0, end_char_index: 17 }],
+				custom: { preserve: ["opaque", "data"] },
+			})) {
+				await t.test(`${role}/${target}/${field}`, () => {
+					const source = {
+						system: [
+							{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli;" },
+							{ type: "text", text: CLAUDE_IDENTITY },
+							{ type: "text", text: core },
+						],
+						messages: [
+							{ role: "user", content: [{ type: "text", text: "[System Instructions]\nKeep permissions." }] },
+							{ role: "assistant", content: [{ type: "text", text: "Understood. I will follow these instructions." }] },
+							{ role: "user", content: [{ type: "text", text: "Actual task" }] },
+						],
+					};
+					const message = source.messages[role === "user" ? 0 : 1];
+					object(target === "message" ? message : message.content[0])[field] = value;
+					const before = structuredClone(source);
+					const result = claudeCodePrompt(source);
+					assert.deepEqual(result.messages[0], { role: "system", content: [
+						{ type: "text", text: source.system.map((block) => block.text).join("\n\n") },
+					] });
+					assert.deepEqual(result.messages.slice(1), source.messages);
+					assert.deepEqual(claudeCodePrompt(result), result);
+					assert.deepEqual(source, before);
+				});
+			}
+		}
+	}
 });
 
 test("native effort history, thinking fields and later rules survive unchanged", async () => {

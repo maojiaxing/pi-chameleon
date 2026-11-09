@@ -1,8 +1,41 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { claudePayloadAdapter } from "../src/claude/payload.ts";
 import { claudeCodeStreamSimple } from "../src/claude/stream.ts";
 import { codexStreamSimple } from "../src/codex/stream.ts";
 import { API_KEY, SESSION_ID, capture, claudeModel, claudeTextResponse, codexModel, codexTextResponse, context, object } from "./fixtures.ts";
+
+test("pre-hook identity normalization preserves opaque metadata and user_id extras", async () => {
+	const source = {
+		messages: [{ role: "user", content: "hello" }],
+		metadata: {
+			trace: { request: "keep-metadata" },
+			user_id: JSON.stringify({ device_id: "replace", account_uuid: "replace", session_id: "replace", extra: { values: ["keep-user-id"] } }),
+		},
+	};
+	const before = structuredClone(source);
+	let calls = 0;
+	const adapter = claudePayloadAdapter(SESSION_ID, (payload) => {
+		calls++;
+		const metadata = object(object(payload).metadata);
+		const identity = JSON.parse(String(metadata.user_id));
+		assert.deepEqual(metadata.trace, { request: "keep-metadata" });
+		assert.deepEqual(identity.extra, { values: ["keep-user-id"] });
+		assert.equal(identity.session_id, SESSION_ID);
+		assert.equal(identity.account_uuid, "");
+		assert.notEqual(identity.device_id, "replace");
+		metadata.hook = "allowed";
+		metadata.user_id = JSON.stringify({ ...identity, session_id: "hook-must-not-override" });
+	});
+	const result = object(await adapter.onPayload(source, claudeModel()));
+	const metadata = object(result.metadata);
+	assert.equal(calls, 1);
+	assert.equal(metadata.hook, "allowed");
+	assert.deepEqual(metadata.trace, source.metadata.trace);
+	assert.deepEqual(JSON.parse(String(metadata.user_id)).extra, { values: ["keep-user-id"] });
+	assert.equal(JSON.parse(String(metadata.user_id)).session_id, SESSION_ID);
+	assert.deepEqual(source, before);
+});
 
 test("concurrent anonymous Claude requests keep independent identities across hook and fetch", async () => {
 	const mock = capture(claudeTextResponse);
