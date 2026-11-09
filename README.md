@@ -261,6 +261,7 @@ pi -e . --list-models chameleon
 - 工具仍放在顶层 `tools`。原生序列化禁用 eager/strict/deferred 工具扩展，不再注入 `__pi_deferred_placeholder__`；可选参数仍可省略，不改成必填 nullable。显式要求 strict 的工具会报不支持，不能静默降低约束。
 - 每轮以当前真实工具集生成顶层 tools；新增/移除工具和后续 system 更新通过 Pi 原生会话转换处理。工具名称出站映射、回程还原，参数与用户数据不受影响。
 - 缓存断点仅位于两块顶层 system、最后一个真实工具和最后一条 user 的末内容块，最多 4 处；调用方 `onPayload` 后再次规范化。schema、工具参数和嵌套结果中的同名键是普通数据，不递归改写。
+- 思考模式在 Pi 序列化前确定：显式模型缺少 `compat.forceAdaptiveThinking` 时，仅按 Pi 内置目录的精确 ID 和当前协议为已知 adaptive 模型补 `true`；不写回 `models.json`，不模糊推断中转别名。显式 `false`、未知/旧模型的预算模式以及关闭思考均保留；中转别名需通过原生 `models` / `modelOverrides` 显式声明该字段。
 - adaptive thinking 保留 `display: updates`；effort 仅在顶层发送，随 Pi 当前选择，不再添加空 per-turn effort 消息；不强制 `low`、`max` 或覆盖显式输出上限。
 - 不伪造 `/model` 历史、记忆、环境路径、技能清单、token 余额或 Claude 专属工具。
 

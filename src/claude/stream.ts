@@ -1,5 +1,6 @@
 // /compat is explicitly supported by the real Pi extension loader.
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model, SimpleStreamOptions, StreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { prepareRelayRequest } from "../relay-transport.ts";
 import { CLAUDE_PROFILE, CLAUDE_SERIALIZER_COMPAT } from "./identity.ts";
@@ -7,6 +8,11 @@ import { claudePayloadAdapter } from "./payload.ts";
 import { restoredStream } from "./tools.ts";
 
 const native = anthropicMessagesApi();
+// Explicit models bypass discovery's capability enrichment. Only use exact native
+// IDs: an older model or an arbitrary relay alias is not evidence of adaptive support.
+const adaptiveModelIds = new Set(getBuiltinModels("anthropic")
+	.filter((model) => model.api === "anthropic-messages" && model.compat?.forceAdaptiveThinking === true)
+	.map((model) => model.id));
 
 function streamClaude(
 	model: Model<Api>, context: TranscriptContext, options: StreamOptions | undefined,
@@ -22,7 +28,14 @@ function streamClaude(
 	// required/null schema transformation after it has already lost intent.
 	const wireModel = {
 		...request.model,
-		compat: { ...request.model.compat, ...CLAUDE_SERIALIZER_COMPAT },
+		compat: {
+			...request.model.compat,
+			...CLAUDE_SERIALIZER_COMPAT,
+			// Select adaptive before Pi maps effort or adjusts a thinking budget/cap.
+			// A native config/API's explicit false remains authoritative.
+			...(request.model.compat?.forceAdaptiveThinking === undefined && adaptiveModelIds.has(request.model.id)
+				? { forceAdaptiveThinking: true } : {}),
+		},
 	};
 	const payload = claudePayloadAdapter(request.options.sessionId, options?.onPayload);
 	const events = delegate(wireModel, context, { ...request.options, onPayload: payload.onPayload });
