@@ -104,6 +104,72 @@ test("only this project's exact prior billing/ACK envelope is migrated, not arbi
 	assert.deepEqual(unrelated.messages.slice(1), source.messages);
 });
 
+test("system blocks that cannot fit the approved text layout fail rather than lose data", () => {
+	const source = { system: [{ type: "text", text: "Keep rules", blocks: [
+		{ type: "tool_reference", name: "read" },
+	] }], messages: [{ role: "user", content: "task" }] };
+	const before = structuredClone(source);
+	assert.throws(() => claudeCodePrompt(source), /unsupported.*system.*field/i);
+	assert.deepEqual(source, before);
+});
+
+test("unknown and near project wrappers are runtime text, not keyword-based deletions", () => {
+	const prefix = claudeCodePrompt({}).system[1].text;
+	for (const system of [
+		[{ type: "text", text: "x-anthropic-billing-header: user rule; cc_entrypoint=custom;" }, { type: "text", text: "Keep rules" }],
+		[{ type: "text", text: prefix + "An ordinary instruction without the identity envelope." }],
+		[{ type: "text", text: CLAUDE_IDENTITY + " " }, { type: "text", text: prefix + "Keep permissions" }],
+	]) {
+		const source = { system, messages: [{ role: "user", content: "task" }] };
+		const result = claudeCodePrompt(source);
+		assert.equal(object(array(object(result.messages[0]).content)[0]).text, system.map((block) => block.text).join("\n\n"));
+		assert.deepEqual(result.messages.slice(1), source.messages);
+		assert.deepEqual(claudeCodePrompt(result), result);
+	}
+});
+
+test("equal initial and history system instructions keep both occurrences and their timing", () => {
+	const source = { system: "Keep rules.  \n", messages: [
+		{ role: "system", content: [{ type: "text", text: "Keep rules.  \n" }] },
+		{ role: "user", content: "Start the task" },
+		{ role: "system", content: [{ type: "text", text: "Updated permissions" }] },
+		{ role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "read", input: { path: "file" } }] },
+		{ role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "result" }] },
+	] };
+	const before = structuredClone(source);
+	const result = claudeCodePrompt(source);
+	assert.equal(result.messages.length, 6);
+	assert.deepEqual(result.messages[0], { role: "system", content: [{ type: "text", text: "Keep rules.  \n" }] });
+	assert.deepEqual(result.messages.slice(1), source.messages);
+	assert.deepEqual(claudeCodePrompt(result), result);
+	assert.deepEqual(source, before);
+});
+
+test("near legacy ACK templates preserve the complete original system and conversation", () => {
+	const current = claudeCodePrompt({});
+	const core = current.system[1].text.split("\n\n# Runtime instructions\n")[0];
+	const source = {
+		system: [
+			{ type: "text", text: "x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli;" },
+			{ type: "text", text: CLAUDE_IDENTITY },
+			{ type: "text", text: core },
+		],
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "[System Instructions]\nKeep permissions." }] },
+			{ role: "assistant", content: [{ type: "text", text: "Understood. I will follow these instructions. " }] },
+			{ role: "system", content: [{ type: "text", text: "Later permission update" }] },
+		],
+	};
+	const before = structuredClone(source);
+	const result = claudeCodePrompt(source);
+	assert.equal(object(result.messages[0]).role, "system");
+	assert.equal(object(array(object(result.messages[0]).content)[0]).text,
+		`x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli;\n\n${CLAUDE_IDENTITY}\n\n${core}`);
+	assert.deepEqual(result.messages.slice(1), source.messages);
+	assert.deepEqual(claudeCodePrompt(result), result);
+	assert.deepEqual(source, before);
+});
+
 test("effort-only markers are removed but later rules and non-effort config survive unchanged", async () => {
 	const input = {
 		system: "Keep rules.",
