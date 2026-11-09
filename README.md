@@ -259,6 +259,8 @@ pi -e . --list-models chameleon
 - 显式 UUID 原样保留，其他显式 session 输入按既有确定性规则转成 UUID。没有 session 的独立 Claude 请求各用一个临时 UUID；需要多轮连续性时由调用方提供稳定 session。不会读取机器名/用户名或保存身份文件，也不承诺标识匿名化。
 - 顶层 system 保留两块身份/core 封装，完整 Pi 初始指令仍放在第一条 system 消息；后续更新保持角色、文本、空白、顺序和时机。不添加 billing、合成 assistant 确认或虚构 token 余额，仅精确迁移已知 SDK/项目包装。
 - 工具采用当前真实集合，出站映射、回程还原，不添加诱饵或执行替代。不同真实名称映射到相同大小写无关 wire 名时发送前报错；schema、参数和嵌套结果保持普通数据。保留非 strict/eager/deferred 序列化边界；要求 strict 的工具明确报不支持，不降低约束。
+- 缓存开关与时长遵循 Pi 原生 `cacheRetention` 及环境/能力协商：`none` 无协议标记；默认/short 使用 ephemeral；long 在能力允许时保留 `ttl: "1h"`，显式不支持 long 时沿用原生短缓存结果。工具缓存能力禁用时不标记工具。
+- 启用缓存后，在最终布局选择两块顶层 system、最后真实工具、最后 user 的末个合法块，最多四处，不补虚构内容。hook 前后使用同一有效设置，执行一次；不能以缓存修复为由改变指令/历史/工具权限，危险替换发送前失败，schema/参数/嵌套结果中的同名键不递归改写。
 - 模型 ID 保留原始后缀、大小写和别名；显示名称不改变 ID，不剥离 `[1m]` / `[1M]`，错误不触发换 ID、UA、Beta 或预算重试。
 - Thinking、effort、预算、display、block_binding、context_management 和历史转换交给当前 Pi 原生 raw/simple 入口。取消请求入口的精确 ID adaptive 补缺，已有目录/模型/显式能力声明不丢失；缺少 adaptive 资料的显式模型按原生 budget 分支处理。使用原生 `models` / `modelOverrides` 声明中转别名的实际能力。
 - 不伪造签名、历史、记忆、环境、技能清单或 Claude 专属工具；正常 SSE、usage、取消和错误语义保持，包装层异常会终止 result 而非悬挂。
