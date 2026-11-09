@@ -1,6 +1,7 @@
 import { normalizeContext, type Api, type Model, type SimpleStreamOptions, type StreamOptions, type TranscriptContext } from "@earendil-works/pi-ai";
 import { getApiProvider, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { claudeCodeStream, claudeCodeStreamSimple } from "../claude/stream.ts";
+import { diagnosticsForSession } from "../claude/diagnostics.ts";
 import { codexStream, codexStreamSimple } from "../codex/stream.ts";
 
 // Mark the registered public handler, not this module instance: real extension reloads
@@ -20,10 +21,10 @@ export function installChameleonRouting(): void {
 		registerApiProvider({
 			api,
 			stream: (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) => matches(model)
-				? stream(model, normalizeContext(context), options)
+				? (provider === "chameleon-claude" ? diagnosticsForSession(options?.sessionId)?.stream ?? stream : stream)(model, normalizeContext(context), options)
 				: original.stream(model, context, options),
 			streamSimple: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) => matches(model)
-				? streamSimple(model, normalizeContext(context), options)
+				? (provider === "chameleon-claude" ? diagnosticsForSession(options?.sessionId)?.streamSimple ?? streamSimple : streamSimple)(model, normalizeContext(context), options)
 				: original.streamSimple(model, context, options),
 		});
 		const registered = getApiProvider(api);
