@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { normalizeContext } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { diagnosticSession, deferred } from "./diagnostics-session.ts";
 import { claudeTextResponse, claudeStart, sse } from "./fixtures.ts";
 
@@ -11,20 +13,21 @@ for (const raw of [false, true]) test(`${raw ? "raw" : "simple"} hook runs once;
 		let transientInconsistent = false;
 		for (const enabled of [false, true]) {
 			await h.command(enabled ? "on" : "off");
-			const stream = h.registry[raw ? "stream" : "streamSimple"](h.model, {
+			const selected = { ...h.model, id: "private-model-sentinel", name: "private-name-sentinel" };
+			const transcript = normalizeContext({
+				tools: [{ name: "private_tool_sentinel", description: "private-description-sentinel",
+					parameters: Type.Object({ private: Type.Literal("private-schema-sentinel") }) }],
 				messages: [{ role: "user", content: "private-prompt-sentinel", timestamp: 0 }],
-			}, {
+			});
+			const stream = h.registry[raw ? "stream" : "streamSimple"](selected, transcript, {
 				sessionId: h.manager.getSessionId(), apiKey: "private-key-sentinel", headers: { "X-Private": "private-header-sentinel" },
 				onPayload(payload) {
 					hooks++;
 					const body = payload as Record<string, any>;
 					body.metadata.user_id = JSON.stringify({ session_id: "private-session-sentinel", device_id: "private-device-sentinel" });
 					transientInconsistent = true;
-					return { ...body, model: "private-model-sentinel", extra: "private-unknown-sentinel",
-						tools: [{ name: "private-tool-sentinel", description: "private-description-sentinel", input_schema: { type: "object", properties: { private: { const: "private-schema-sentinel" } } } }],
-						messages: [{ role: "user", content: [{ type: "text", text: "private-result-sentinel" },
-							{ type: "tool_use", id: "private-call-sentinel", name: "private-tool-sentinel", input: { secret: "private-params-sentinel" } }] }],
-					};
+					body.messages.push({ role: "user", content: [{ type: "text", text: "private-result-sentinel" }] });
+					return { ...body, extra: { unknown: "private-unknown-sentinel", input: "private-params-sentinel" } };
 				},
 				fetch: async (_input, init) => {
 					wires.push(String(init?.body));
