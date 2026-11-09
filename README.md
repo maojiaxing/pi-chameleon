@@ -251,6 +251,20 @@ pi -e . --list-models chameleon
 - 用户或已适配服务的有效价格按字段优先级生效。本地官方价格仅作**参考费用**，不是中转站实际账单；完全未知费率用 **0 占位**满足 Pi 数值字段，标注“费用未知”，与有效零价格区分。
 - 第一版不修改 Pi 原生费用栏；原生统计可能显示零估算，**不代表免费**。请依据中转站实际账单判断支出，而不是候选目录、参考估算或未知占位。
 
+## Claude 兼容诊断
+
+```text
+/chameleon-diagnostics on
+/chameleon-diagnostics status
+/chameleon-diagnostics off
+```
+
+- 默认关闭，显式开启只在当前会话/运行实例生效；关闭、切换会话或 `/reload` 会清空进行中与最近完成摘要，晚到结果不会恢复旧记录。
+- 最多保留 8 个进行中摘要和最近 1 个完成摘要。并发请求独立编号；容量不足或归属不明确时显示 `incomplete`，不混合数据。
+- 摘要只含固定规则/版本、阶段、工具与块数量、缓存状态、身份一致性、HTTP 状态及安全结果类别；不保存提示、参数/结果、schema、任意 headers、URL、凭据、自定义模型名或线上身份。诊断编号独立生成，不是 session/device 的哈希。
+- `adapted` 仅表示 hook 入口已看到适配；`final-observed` 是安全规范化后的出站边界。只有收到响应才确认 `dispatched` / `http`；HTTP 200 不等于流成功，错误码不自动归因于 UA/Beta 或触发降级重试。
+- 无落盘、导出、上传或遥测。诊断失败不阻断本来合法的请求；诊断关闭也不会绕过协议/安全校验。摘要仍可能有数量/时序关联信息，**不承诺匿名或可无条件公开**。
+
 ## Claude 伪装
 
 - 仅强制 `claude-cli/2.1.274 (external, cli)`、`x-app: cli` 和动态 session header。不硬编码 Windows/Node/Stainless/SDK 版本、不额外生成 trace ID，也不额外添加 `beta=true`。原生 SDK 的协议字段仍正常保留。
