@@ -18,6 +18,7 @@ export interface DiscoveryProviderDependencies {
 	clock?: DiscoveryClock;
 	resolveAccess(): Promise<DiscoveryAccess | undefined>;
 	onChange?(state: DiscoveryState): void;
+	claudeStreams?: { stream: typeof claudeCodeStream; streamSimple: typeof claudeCodeStreamSimple };
 }
 
 /** Canonicalize actual HTTP headers, including case folding and null deletions. */
@@ -61,7 +62,7 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 		id, name: family === "claude" ? "Chameleon Claude (Claude Code disguise)" : "Chameleon Codex (Codex CLI disguise)",
 		auth: { apiKey: envApiKeyAuth("Relay API key", []) }, models: [],
 		api: family === "claude"
-			? { stream: claudeCodeStream, streamSimple: claudeCodeStreamSimple }
+			? deps.claudeStreams ?? { stream: claudeCodeStream, streamSimple: claudeCodeStreamSimple }
 			: { stream: codexStream, streamSimple: codexStreamSimple },
 	});
 	const provider: Provider = {
