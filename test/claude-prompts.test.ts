@@ -32,7 +32,7 @@ test("Claude prompt retains exact Pi text and its system role, without changing 
 	assert.equal(object(array(messages[0].content)[0]).text, prompt);
 	assert.equal(messages[0].output_config, undefined);
 	assert.deepEqual(object(array(messages[1].content)[0]).cache_control, { type: "ephemeral" });
-	assert.deepEqual(body.context_management, { edits: [{ type: "clear_thinking_20251015", keep: "all" }] });
+	assert.equal(body.context_management, undefined);
 });
 
 test("empty runtime uses the two fixed capture blocks without invented conversation or capabilities", async () => {
@@ -170,7 +170,7 @@ test("near legacy ACK templates preserve the complete original system and conver
 	assert.deepEqual(source, before);
 });
 
-test("effort-only markers are removed but later rules and non-effort config survive unchanged", async () => {
+test("native effort history, thinking fields and later rules survive unchanged", async () => {
 	const input = {
 		system: "Keep rules.",
 		thinking: { type: "adaptive", display: "summarized", block_binding: { prefix_mismatch_behavior: "drop_block" } },
@@ -184,14 +184,15 @@ test("effort-only markers are removed but later rules and non-effort config surv
 	const before = structuredClone(input);
 	const adapter = claudePayloadAdapter(SESSION_ID);
 	const once = object(await adapter.onPayload(input, claudeModel()));
-	assert.deepEqual(once.thinking, { type: "adaptive", display: "updates" });
+	assert.deepEqual(once.thinking, input.thinking);
 	assert.deepEqual(once.output_config, input.output_config);
 	const messages = array(once.messages).map(object);
-	assert.deepEqual(messages.map((message) => message.role), ["system", "user", "system"]);
-	assert.equal(object(array(messages[2].content)[0]).text, "Real environment");
-	assert.deepEqual(messages[2].output_config, { format: { type: "json_schema" } });
+	assert.deepEqual(messages.map((message) => message.role), ["system", "system", "user", "system"]);
+	assert.equal(object(array(messages[3].content)[0]).text, "Real environment");
+	assert.deepEqual(messages[1].output_config, { effort: "low" });
+	assert.deepEqual(messages[3].output_config, input.messages[2].output_config);
 	assert.deepEqual(input, before);
 	assert.deepEqual(await adapter.onPayload(once, claudeModel()), once);
-	assert.equal(await adapter.onPayload(null, claudeModel()), null);
-	assert.equal(await adapter.onPayload(undefined, claudeModel()), undefined);
+	await assert.rejects(adapter.onPayload(null, claudeModel()), /metadata|payload/);
+	await assert.rejects(adapter.onPayload(undefined, claudeModel()), /metadata|payload/);
 });

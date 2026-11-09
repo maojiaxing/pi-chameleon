@@ -5,6 +5,7 @@ import type { Api, Model, SimpleStreamOptions, StreamOptions, TranscriptContext 
 import { prepareRelayRequest } from "../relay-transport.ts";
 import { CLAUDE_PROFILE, CLAUDE_SERIALIZER_COMPAT } from "./identity.ts";
 import { claudePayloadAdapter } from "./payload.ts";
+import { resolveClaudeCachePolicy } from "./cache-policy.ts";
 import { restoredStream } from "./tools.ts";
 
 const native = anthropicMessagesApi();
@@ -30,9 +31,11 @@ function streamClaude(
 			...CLAUDE_SERIALIZER_COMPAT,
 		},
 	};
-	const payload = claudePayloadAdapter(request.options.sessionId, options?.onPayload);
+	const cachePolicy = resolveClaudeCachePolicy(request.options, wireModel);
+	const payload = claudePayloadAdapter(request.options.sessionId, options?.onPayload, cachePolicy);
 	const events = delegate(wireModel, context, {
 		...request.options,
+		cacheRetention: cachePolicy.retention,
 		async onPayload(params, nativeModel) {
 			const nativeParams = params as Record<string, unknown>;
 			const betas = Array.isArray(nativeParams.betas) ? [...nativeParams.betas] : undefined;

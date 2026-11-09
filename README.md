@@ -6,7 +6,7 @@ Pi 扩展：使用你自己的中转 API key，将 Pi 的真实对话适配为 *
 
 | Provider | 线格式 | 默认认证 | 已适配 CLI |
 |---|---|---|---|
-| `chameleon-claude` | Anthropic Messages | `x-api-key` | Claude Code `2.1.302` |
+| `chameleon-claude` | Anthropic Messages | `x-api-key` | Claude Code UA `2.1.274`（组合兼容策略） |
 | `chameleon-codex` | OpenAI Responses | `Authorization: Bearer` | Codex CLI `0.166.0` |
 
 中转站要求两者都使用 Bearer 时，可以使用 Pi 原生的 `authHeader: true`，见下方示例。
@@ -193,7 +193,7 @@ pi -e . --list-models chameleon
 
 | Provider | `baseUrl` 示例 | 最终请求 |
 |---|---|---|
-| Claude | `https://relay.example.com` | `/v1/messages?beta=true` |
+| Claude | `https://relay.example.com` | `/v1/messages`（query 由原生 SDK / 配置决定） |
 | Codex | `https://relay.example.com/v1` | `/v1/responses` |
 | Codex，自定义网关前缀 | `https://relay.example.com/gateway/openai` | `/gateway/openai/responses` |
 
@@ -253,23 +253,23 @@ pi -e . --list-models chameleon
 
 ## Claude 伪装
 
-- 指纹固定为 `claude-cli/2.1.302 (external, cli)`，不追加 Pi UA；发送用户抓包顺序的 11 项 beta。
-- Stainless header 指纹固定为 Windows/x64/node v26.3.0、package 0.128.0、retry count 0、timeout 60000；这是 header 指纹，不代表真实运行环境。实际请求超时由 Pi 的 `timeoutMs` 决定，默认 600 秒。
-- `metadata.user_id.session_id` 与 `x-claude-code-session-id` 一致；device ID 为进程级随机值，trace ID 每次请求重新生成，不复用抓包标识。
-- 顶层 system 固定两块：Claude Code 身份，以及通用 core + 空的 `# Runtime instructions` 前缀；与用户提供的真实 Aether 出站样本逐字对拍，不添加 billing、合成 assistant 确认或虚构 token 余额。
-- 完整 Pi 运行指令放在 `messages[0].role=system`，保留实际工具说明、权限、项目规则、环境与原始空白；原有 user/assistant 历史随后接上，不把 system 降级为 user。只对本项目精确识别的旧模板做迁移。
-- 工具仍放在顶层 `tools`。原生序列化禁用 eager/strict/deferred 工具扩展，不再注入 `__pi_deferred_placeholder__`；可选参数仍可省略，不改成必填 nullable。显式要求 strict 的工具会报不支持，不能静默降低约束。
-- 每轮以当前真实工具集生成顶层 tools；新增/移除工具和后续 system 更新通过 Pi 原生会话转换处理。工具名称出站映射、回程还原，参数与用户数据不受影响。
-- 缓存断点仅位于两块顶层 system、最后一个真实工具和最后一条 user 的末内容块，最多 4 处；调用方 `onPayload` 后再次规范化。schema、工具参数和嵌套结果中的同名键是普通数据，不递归改写。
-- 思考模式在 Pi 序列化前确定：显式模型缺少 `compat.forceAdaptiveThinking` 时，仅按 Pi 内置目录的精确 ID 和当前协议为已知 adaptive 模型补 `true`；不写回 `models.json`，不模糊推断中转别名。显式 `false`、未知/旧模型的预算模式以及关闭思考均保留；中转别名需通过原生 `models` / `modelOverrides` 显式声明该字段。
-- adaptive thinking 保留 `display: updates`；effort 仅在顶层发送，随 Pi 当前选择，不再添加空 per-turn effort 消息；不强制 `low`、`max` 或覆盖显式输出上限。
-- 不伪造 `/model` 历史、记忆、环境路径、技能清单、token 余额或 Claude 专属工具。
+- 仅强制 `claude-cli/2.1.274 (external, cli)`、`x-app: cli` 和动态 session header。不硬编码 Windows/Node/Stainless/SDK 版本、不额外生成 trace ID，也不额外添加 `beta=true`。原生 SDK 的协议字段仍正常保留。
+- Beta 由 Pi 按有效模型能力与请求选项生成，保持原生顺序，最后只补缺 `context-1m-2025-08-07`；不再固定 11 项，也不把 Beta 当作能力或中转可用性证明。原始 header、大小写/null 变体及 payload hook 不能覆盖这套生成规则。
+- `metadata.user_id.session_id` 与 `x-claude-code-session-id` 在 hook 后及最终出站保持一致；device 是运行实例内稳定的随机 64 位 hex，account_uuid 保持空字符串。其他合法 metadata 保留，无法安全处理的结构在发送前失败。
+- 显式 UUID 原样保留，其他显式 session 输入按既有确定性规则转成 UUID。没有 session 的独立 Claude 请求各用一个临时 UUID；需要多轮连续性时由调用方提供稳定 session。不会读取机器名/用户名或保存身份文件，也不承诺标识匿名化。
+- 顶层 system 保留两块身份/core 封装，完整 Pi 初始指令仍放在第一条 system 消息；后续更新保持角色、文本、空白、顺序和时机。不添加 billing、合成 assistant 确认或虚构 token 余额，仅精确迁移已知 SDK/项目包装。
+- 工具采用当前真实集合，出站映射、回程还原，不添加诱饵或执行替代。不同真实名称映射到相同大小写无关 wire 名时发送前报错；schema、参数和嵌套结果保持普通数据。保留非 strict/eager/deferred 序列化边界；要求 strict 的工具明确报不支持，不降低约束。
+- 缓存开关与时长遵循 Pi 原生 `cacheRetention` 及环境/能力协商：`none` 无协议标记；默认/short 使用 ephemeral；long 在能力允许时保留 `ttl: "1h"`，显式不支持 long 时沿用原生短缓存结果。工具缓存能力禁用时不标记工具。
+- 启用缓存后，在最终布局选择两块顶层 system、最后真实工具、最后 user 的末个合法块，最多四处，不补虚构内容。hook 前后使用同一有效设置，执行一次；不能以缓存修复为由改变指令/历史/工具权限，危险替换发送前失败，schema/参数/嵌套结果中的同名键不递归改写。
+- 模型 ID 保留原始后缀、大小写和别名；显示名称不改变 ID，不剥离 `[1m]` / `[1M]`，错误不触发换 ID、UA、Beta 或预算重试。
+- Thinking、effort、预算、display、block_binding、context_management 和历史转换交给当前 Pi 原生 raw/simple 入口。取消请求入口的精确 ID adaptive 补缺，已有目录/模型/显式能力声明不丢失；缺少 adaptive 资料的显式模型按原生 budget 分支处理。使用原生 `models` / `modelOverrides` 声明中转别名的实际能力。
+- 不伪造签名、历史、记忆、环境、技能清单或 Claude 专属工具；正常 SSE、usage、取消和错误语义保持，包装层异常会终止 result 而非悬挂。
 
-当前对齐目标是用户提供的**实际 Aether 出站抓包**，不是固定 Rust 源码中另一个会添加 billing 和 user/assistant 前缀的分支。没有复制 Aether 源码、抓包中的个人目录、对话、凭据或工具清单；headers 仍沿用用户已核对的 2.1.302 指纹。
+这是经批准的组合策略：保留原 System/真实工具布局，采用参考最小 headers、native + 1M Beta 与原生 thinking 委托。**不宣称完整复刻任一 Claude Code 版本或已经认证所有中转。**
 
 协议转换、SSE、usage 和取消继续委托 Pi 原生 `anthropic-messages`。离线回归包含连续三轮真实历史传递，以及执行本地 `read` 后回传原始文件内容的工具链路。
 
-已授权的真实验证需要区分三种结果：
+以下是旧策略下已授权的历史验证记录，不是本轮组合策略的真实中转认证：
 
 | 驱动方式与任务 | 实际结果 |
 |---|---|

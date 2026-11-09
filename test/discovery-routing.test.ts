@@ -69,12 +69,12 @@ test("an explicit Claude JSON model uses the CLI wrapper when the native base ca
 		});
 		assert.equal(result.stopReason, "stop", result.errorMessage);
 		const request = mock.requests[0];
-		assert.match(request.headers.get("user-agent")!, /^claude-cli\/2\.1\.302/);
+		assert.match(request.headers.get("user-agent")!, /^claude-cli\/2\.1\.274/);
 		assert.equal(request.url, `${baseUrl}/v1/messages?beta=true`);
 		assert.equal(request.redirect, "error");
 		assert.equal(request.headers.get("x-api-key"), key);
 		for (const name of ["authorization", "cookie", "originator", "chatgpt-account-id", "proxy-authorization"]) assert.equal(request.headers.get(name), null);
-		assert.equal(request.headers.get("anthropic-beta"), CLAUDE_BETAS.join(","));
+		assert.equal(request.headers.get("anthropic-beta"), "fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07");
 		assert.equal(request.body.model, "private-claude");
 		assert.equal(request.body.max_tokens, 777);
 		assert.equal(object(request.body.output_config).effort, "high");
@@ -117,7 +117,7 @@ test("empty-base Claude raw streaming keeps caller effort and output cap", { tim
 		const mock = capture(claudeTextResponse);
 		const result = await runtime.stream(model, context(), { fetch: mock.fetch, thinkingEnabled: true, effort: "medium", maxTokens: 654 }).result();
 		assert.equal(result.stopReason, "stop", result.errorMessage);
-		assert.match(mock.requests[0].headers.get("user-agent")!, /^claude-cli\/2\.1\.302/);
+		assert.match(mock.requests[0].headers.get("user-agent")!, /^claude-cli\/2\.1\.274/);
 		assert.equal(mock.requests[0].body.max_tokens, 654);
 		assert.equal(object(mock.requests[0].body.output_config).effort, "medium");
 		assert.equal(array(mock.requests[0].body.system).length, 2);
@@ -145,7 +145,7 @@ for (const family of ["claude", "codex"] as const) {
 				assert.equal(mock.requests.length, 1);
 				assert.equal(mock.requests[0].redirect, "error");
 				if (family === "claude") {
-					assert.match(mock.requests[0].headers.get("user-agent")!, /^claude-cli\/2\.1\.302/);
+					assert.match(mock.requests[0].headers.get("user-agent")!, /^claude-cli\/2\.1\.274/);
 					assert.equal(array(mock.requests[0].body.system).length, 2);
 				} else assert.equal(mock.requests[0].headers.get("originator"), "codex_cli_rs");
 			}
