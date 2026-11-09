@@ -8,6 +8,8 @@ export interface RelayProfile<TApi extends Api> {
 	auth: "x-api-key" | "bearer";
 	headers(sessionId: string): ProviderHeaders;
 	rewriteUrl?(url: URL): void;
+	protectedHeaders?: readonly string[];
+	finalizeHeaders?(headers: ProviderHeaders): void;
 	omitHeader?(name: string): boolean;
 }
 
@@ -36,8 +38,23 @@ function checkedUrl(value: string): URL {
 
 
 /** Normalize before merging, retaining null deletions through SDK assembly. */
-function mergeHeaders(target: ProviderHeaders, source: ProviderHeaders): void {
-	for (const [name, value] of Object.entries(source)) target[name.toLowerCase()] = value;
+function mergeHeaders(target: ProviderHeaders, source: ProviderHeaders, protectedNames?: ReadonlySet<string>): void {
+	for (const [name, value] of Object.entries(source)) {
+		if (protectedNames?.has(name.toLowerCase())) continue;
+		target[name.toLowerCase()] = value;
+	}
+}
+
+function protectedHeaderSet<TApi extends Api>(profile: RelayProfile<TApi>): ReadonlySet<string> {
+	return new Set((profile.protectedHeaders ?? []).map((name) => name.toLowerCase()));
+}
+
+function withoutProtectedHeaders<TApi extends Api>(profile: RelayProfile<TApi>, source: ProviderHeaders | undefined): ProviderHeaders {
+	if (!profile.protectedHeaders?.length) return source ?? {};
+	const protectedNames = protectedHeaderSet(profile);
+	const result: ProviderHeaders = {};
+	mergeHeaders(result, source ?? {}, protectedNames);
+	return result;
 }
 
 function requestHeaders<TApi extends Api>(
@@ -46,7 +63,7 @@ function requestHeaders<TApi extends Api>(
 ): ProviderHeaders {
 	const headers: ProviderHeaders = {};
 	mergeHeaders(headers, inherited);
-	mergeHeaders(headers, caller ?? {});
+	mergeHeaders(headers, caller ?? {}, protectedHeaderSet(profile));
 	// Pi's native authHeader:true has already resolved the configured key and
 	// supplied this Bearer header. Honor it without parsing models.json or
 	// accepting an unrelated inherited credential.
@@ -80,6 +97,7 @@ function relayFetch<TApi extends Api>(
 		const inherited = new Headers(input instanceof Request ? input.headers : undefined);
 		for (const [name, value] of new Headers(init?.headers)) inherited.set(name, value);
 		const enforced = requestHeaders(profile, sessionId, apiKey, headers, Object.fromEntries(inherited));
+		profile.finalizeHeaders?.(enforced);
 		const outgoing = new Headers();
 		for (const [name, value] of Object.entries(enforced)) {
 			if (value !== null) outgoing.set(name, value);
@@ -109,15 +127,20 @@ export function prepareRelayRequest<TApi extends Api>(
 	const sessionId = sessionUuid(options?.sessionId);
 	const baseUrl = model.baseUrl;
 	checkedUrl(baseUrl);
+	const safeCallerHeaders = withoutProtectedHeaders(profile, options?.headers);
+	const safeModel = {
+		...model,
+		headers: withoutProtectedHeaders(profile, model.headers),
+	};
 	return {
-		model: model as Model<TApi>,
+		model: safeModel as Model<TApi>,
 		options: {
 			...options,
 			// Header-owned auth avoids native token-format/OAuth inference.
 			apiKey: undefined,
 			sessionId,
-			headers: requestHeaders(profile, sessionId, apiKey, options?.headers),
-			fetch: relayFetch(profile, baseUrl, apiKey, sessionId, options?.headers, options?.fetch ?? globalThis.fetch),
+			headers: requestHeaders(profile, sessionId, apiKey, safeCallerHeaders),
+			fetch: relayFetch(profile, baseUrl, apiKey, sessionId, safeCallerHeaders, options?.fetch ?? globalThis.fetch),
 			timeoutMs: options?.timeoutMs ?? 600_000,
 			maxRetries: options?.maxRetries ?? 0,
 		},
