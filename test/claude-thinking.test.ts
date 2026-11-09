@@ -5,7 +5,7 @@ import { claudeCodeStream, claudeCodeStreamSimple } from "../src/claude/stream.t
 import { capture, claudeTextResponse, object } from "./fixtures.ts";
 
 // Replay a native models.json model whose capability metadata has no adaptive flag.
-// Unlike the transport fixtures, this input does not pre-fill forceAdaptiveThinking.
+// The compatibility layer must leave the native budget branch in charge.
 const configuredModel: Model<"anthropic-messages"> = {
 	type: "chat", api: "anthropic-messages", provider: "chameleon-claude",
 	id: "claude-opus-4-6", name: "Claude Opus 4.6", baseUrl: "https://relay.example.test",
@@ -17,39 +17,36 @@ const conversation = normalizeContext({
 	messages: [{ role: "user", content: "Reply ok.", timestamp: 1 }],
 });
 
-test("Claude models without adaptive metadata emit adaptive thinking instead of a token budget", { timeout: 5_000 }, async () => {
+test("Claude models without adaptive metadata retain native budget thinking", { timeout: 5_000 }, async () => {
 	const mock = capture(claudeTextResponse);
 	const result = await claudeCodeStreamSimple(configuredModel, conversation, {
-		apiKey: "synthetic-offline-key", reasoning: "high", fetch: mock.fetch,
+		apiKey: "synthetic-offline-key", reasoning: "high", thinkingBudgets: { high: 4096 }, fetch: mock.fetch,
 	}).result();
 	assert.equal(result.stopReason, "stop", result.errorMessage);
-	assert.equal(mock.requests.length, 1);
-	assert.deepEqual(mock.requests[0].body.thinking, { type: "adaptive", display: "updates" });
-	assert.equal("budget_tokens" in object(mock.requests[0].body.thinking), false);
-	assert.deepEqual(mock.requests[0].body.output_config, { effort: "high" });
+	assert.deepEqual(mock.requests[0].body.thinking, { type: "enabled", budget_tokens: 4096, display: "summarized" });
+	assert.equal("output_config" in mock.requests[0].body, false);
 });
 
 for (const id of ["claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-5-5", "claude-sonnet-5-5"]) {
-	test(`known adaptive model ${id} needs no manually prefilled compat`, { timeout: 5_000 }, async () => {
+	test(`known model ${id} without adaptive metadata retains native budget thinking`, { timeout: 5_000 }, async () => {
 		const model = { ...configuredModel, id, compat: { supportsTemperature: false } };
 		const before = structuredClone(model);
 		const mock = capture(claudeTextResponse);
 		const result = await claudeCodeStreamSimple(model, conversation, {
-			apiKey: "synthetic-offline-key", reasoning: "medium", maxTokens: 2048, fetch: mock.fetch,
+			apiKey: "synthetic-offline-key", reasoning: "medium", thinkingBudgets: { medium: 2048 }, maxTokens: 2048, fetch: mock.fetch,
 			onPayload: (payload, wireModel) => {
-				assert.ok(wireModel.compat && "forceAdaptiveThinking" in wireModel.compat);
-				assert.equal(wireModel.compat.forceAdaptiveThinking, true, "select the native adaptive branch before payload adaptation");
-				assert.deepEqual(object(payload).thinking, { type: "adaptive", display: "updates" });
+				assert.equal(wireModel.compat && "forceAdaptiveThinking" in wireModel.compat, false);
+				assert.deepEqual(object(payload).thinking, { type: "enabled", budget_tokens: 2048, display: "summarized" });
 			},
 		}).result();
 		assert.equal(result.stopReason, "stop", result.errorMessage);
-		assert.deepEqual(mock.requests[0].body.output_config, { effort: "medium" });
-		assert.equal(mock.requests[0].body.max_tokens, 2048, "adaptive must not run the budget/cap adjustment");
+		assert.deepEqual(mock.requests[0].body.thinking, { type: "enabled", budget_tokens: 2048, display: "summarized" });
+		assert.equal("output_config" in mock.requests[0].body, false);
 		assert.deepEqual(model, before, "request defaults must not mutate native configuration");
 	});
 }
 
-test("raw Claude stream receives the same adaptive default without reinterpreting its effort", { timeout: 5_000 }, async () => {
+test("raw Claude stream preserves native budget thinking and effort absence", { timeout: 5_000 }, async () => {
 	const mock = capture(claudeTextResponse);
 	const options = {
 		apiKey: "synthetic-offline-key", thinkingEnabled: true, effort: "low", thinkingBudgetTokens: 4096,
@@ -57,8 +54,8 @@ test("raw Claude stream receives the same adaptive default without reinterpretin
 	};
 	const result = await claudeCodeStream(configuredModel, conversation, options).result();
 	assert.equal(result.stopReason, "stop", result.errorMessage);
-	assert.deepEqual(mock.requests[0].body.thinking, { type: "adaptive", display: "updates" });
-	assert.deepEqual(mock.requests[0].body.output_config, { effort: "low" });
+	assert.deepEqual(mock.requests[0].body.thinking, { type: "enabled", budget_tokens: 4096, display: "summarized" });
+	assert.equal("output_config" in mock.requests[0].body, false);
 	assert.equal(mock.requests[0].body.max_tokens, 2048);
 });
 
@@ -105,6 +102,6 @@ test("explicit adaptive metadata and native thinking maps work for arbitrary rel
 		thinkingLevelMap: { xhigh: "max" },
 	}, conversation, { apiKey: "synthetic-offline-key", reasoning: "xhigh", fetch: mock.fetch }).result();
 	assert.equal(result.stopReason, "stop", result.errorMessage);
-	assert.deepEqual(mock.requests[0].body.thinking, { type: "adaptive", display: "updates" });
+	assert.deepEqual(mock.requests[0].body.thinking, { type: "adaptive", display: "summarized" });
 	assert.deepEqual(mock.requests[0].body.output_config, { effort: "max" });
 });

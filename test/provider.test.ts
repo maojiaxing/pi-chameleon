@@ -126,7 +126,7 @@ test("Pi models.json alone configures both CLI adapters with the same relay key"
 	});
 });
 
-test("explicit native Claude models without adaptive metadata choose adaptive before serialization", { timeout: 20_000 }, async () => {
+test("explicit native Claude models without adaptive metadata retain native budget thinking", { timeout: 20_000 }, async () => {
 	const definition = {
 		id: "claude-opus-4-6", name: "Explicit Claude", reasoning: true, input: ["text"],
 		contextWindow: 200_000, maxTokens: 64_000,
@@ -143,12 +143,12 @@ test("explicit native Claude models without adaptive metadata choose adaptive be
 		const configBefore = await readFile(path, "utf8");
 		const modelBefore = structuredClone(model);
 		const mock = capture(claudeTextResponse);
-		const result = await runtime.completeSimple(model, context(), { fetch: mock.fetch, reasoning: "high", maxTokens: 2048 });
+		const result = await runtime.completeSimple(model, context(), { fetch: mock.fetch, reasoning: "high", thinkingBudgets: { high: 2048 }, maxTokens: 2048 });
 		assert.equal(result.stopReason, "stop", result.errorMessage);
 		assert.equal(mock.requests.length, 1);
-		assert.deepEqual(mock.requests[0].body.thinking, { type: "adaptive", display: "updates" });
-		assert.deepEqual(mock.requests[0].body.output_config, { effort: "high" });
-		assert.equal(mock.requests[0].body.max_tokens, 2048, "choose adaptive before Pi adjusts the budget/cap");
+		assert.deepEqual(mock.requests[0].body.thinking, { type: "enabled", budget_tokens: 2048, display: "summarized" });
+		assert.equal("output_config" in mock.requests[0].body, false);
+		assert.equal(mock.requests[0].body.max_tokens, 4096, "native budget adjustment reserves output tokens");
 		assert.deepEqual(model, modelBefore);
 		assert.equal(await readFile(path, "utf8"), configBefore, "defaults must not rewrite models.json");
 	}, { fixtureModels: false, discoveredModels: [] });

@@ -1,5 +1,5 @@
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { CONTEXT_MANAGEMENT, EPHEMERAL, THINKING } from "./identity.ts";
+import { EPHEMERAL } from "./identity.ts";
 import { DEVICE_ID } from "../identity.ts";
 import { claudeCodePrompt } from "./prompts.ts";
 import { wireToolNamesDeep } from "./tools.ts";
@@ -48,37 +48,17 @@ function alignCacheBreakpoints(value: unknown): unknown {
 	return body;
 }
 
-/** Current effort lives at top-level; strip only old effort-only system markers. */
-function removePerTurnEffort(messages: unknown[]): unknown[] {
-	return messages.flatMap((message) => {
-		if (!isRecord(message) || message.role !== "system" || !isRecord(message.output_config) ||
-			!Object.hasOwn(message.output_config, "effort")) return [message];
-		const { effort: _effort, ...outputConfig } = message.output_config;
-		const { output_config: _outputConfig, ...rest } = message;
-		if (Object.keys(outputConfig).length > 0) return [{ ...rest, output_config: outputConfig }];
-		if (Array.isArray(rest.content) && rest.content.length === 0 &&
-			Object.keys(rest).every((key) => key === "role" || key === "content")) return [];
-		return [rest];
-	});
-}
-
 function compatiblePayload(payload: unknown, sessionId: string): { payload: unknown; fromWire: ReadonlyMap<string, string> } {
 	if (!isRecord(payload)) return { payload, fromWire: new Map() };
 	const { system, messages } = claudeCodePrompt(payload);
-	let thinking = payload.thinking;
-	if (isRecord(thinking) && thinking.type === "adaptive") {
-		const { block_binding: _binding, ...adaptive } = thinking;
-		thinking = { ...adaptive, ...THINKING };
-	}
 	const fromWire = new Map<string, string>();
-	// Native serialization already emitted ordinary tool schemas. Do not try
-	// to strip strict flags/nulls afterward: a require-strict tool must error.
+	// Native serialization already emitted thinking, effort history, and ordinary tool schemas.
+	// Do not reinterpret those fields after the SDK has selected their semantics.
 	const wired = wireToolNamesDeep({
 		...payload,
 		system,
-		messages: removePerTurnEffort(messages),
+		messages,
 		tools: payload.tools ?? [],
-		...(thinking !== undefined ? { thinking } : {}),
 	}, fromWire);
 	return {
 		payload: {
@@ -87,7 +67,6 @@ function compatiblePayload(payload: unknown, sessionId: string): { payload: unkn
 				...(isRecord(payload.metadata) ? payload.metadata : {}),
 				user_id: JSON.stringify({ device_id: DEVICE_ID, account_uuid: "", session_id: sessionId }),
 			},
-			context_management: CONTEXT_MANAGEMENT,
 		},
 		fromWire,
 	};
