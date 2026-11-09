@@ -1,5 +1,6 @@
 import {
 	createAssistantMessageEventStream,
+	type AssistantMessage,
 	type AssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 
@@ -124,15 +125,26 @@ export function restoredStream(
 ): AssistantMessageEventStream {
 	const out = createAssistantMessageEventStream();
 	void (async () => {
+		let latest: AssistantMessage | undefined;
 		try {
 			for await (const event of events) {
+				latest = "partial" in event ? event.partial : event.type === "done" ? event.message : event.type === "error" ? event.error : latest;
 				restoreName(event, fromWire());
 				out.push(event);
 			}
 		} catch {
-			// The inner stream terminates with `error` events rather than throwing;
-			// guard anyway so the outer stream never hangs.
-			out.end();
+			// end(undefined) does not settle Pi's result promise. Emit a terminal
+			// error without copying arbitrary wrapper exception text.
+			const error: AssistantMessage = {
+				...(latest ?? {
+					role: "assistant", api: "anthropic-messages", provider: "chameleon-claude", model: "unknown",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					timestamp: Date.now(),
+				}),
+				content: [], stopReason: "error", errorMessage: "Claude stream tool restoration failed",
+			};
+			out.push({ type: "error", reason: "error", error });
 		}
 	})();
 	return out;
