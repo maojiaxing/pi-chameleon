@@ -161,4 +161,3 @@ test("last eligible user block is cached instead of trailing empty content", asy
 		assert.equal(markers(mock.requests[0].body).length, 4);
 	}
 });
-
