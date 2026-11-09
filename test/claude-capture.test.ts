@@ -272,7 +272,7 @@ test("serialized instruction-only messages cannot shift the effective cache mark
 	assert.deepEqual(messages.map((message) => message.role), ["system", "user", "assistant", "user", "system"]);
 	assert.equal(object(array(messages[3].content)[0]).tool_use_id, "toolu_fixture");
 	assert.equal(object(array(messages[4].content)[0]).text, "Keep later project rules.");
-	assert.equal(messages[4].output_config, undefined);
+	assert.deepEqual(messages[4].output_config, { effort: "high" });
 	assert.deepEqual(cacheLocations(body), ["system:0", "system:1", "message:3:0"]);
 	assert.deepEqual(await adapter.onPayload(body, claudeModel()), body);
 });
