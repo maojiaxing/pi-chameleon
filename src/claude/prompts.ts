@@ -48,7 +48,7 @@ The following instructions describe this session's actual runtime. Use its tool 
 const OLD_INSTRUCTIONS_PREFIX = "[System Instructions]\n";
 const OLD_ACK = "Understood. I will follow these instructions.";
 const SDK_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-const isBilling = (text: string) => /^x-anthropic-billing-header:[^\r\n]*cc_entrypoint=[^\r\n]*$/.test(text);
+const isBilling = (text: string) => /^x-anthropic-billing-header: cc_version=\d+\.\d+\.\d+\.[0-9a-f]+; cc_entrypoint=(?:cli|sdk-cli);$/.test(text);
 
 function textBlocks(value: unknown): SystemTextBlock[] {
 	if (value == null) return [];
@@ -57,6 +57,9 @@ function textBlocks(value: unknown): SystemTextBlock[] {
 	return value.map((block) => {
 		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") {
 			throw new Error("Claude system prompt contains a non-text block");
+		}
+		if (Object.keys(block).some((key) => !["type", "text", "cache_control"].includes(key))) {
+			throw new Error("Unsupported Claude system prompt field: cannot preserve the text layout");
 		}
 		return { ...block, type: "text", text: block.text };
 	});
@@ -89,16 +92,21 @@ export function claudeCodePrompt(source: Record<string, unknown>): { system: Sys
 			runtime = instruction.slice(OLD_INSTRUCTIONS_PREFIX.length);
 			messages.splice(0, 2);
 		} else {
-			runtime = "";
+			// The full synthetic conversation is part of the migration template.
+			// A near match is ordinary input, including every system block.
+			runtime = texts.join("\n\n");
 		}
 	} else {
-		while (texts[0] !== undefined && isBilling(texts[0].trim())) texts.shift();
-		if (texts[0] === SDK_IDENTITY) texts.shift();
-		if (texts[0] === CLAUDE_CODE_IDENTITY) texts.shift();
-		if (texts[0]?.startsWith(CLAUDE_CODE_PROMPT_PREFIX)) texts[0] = texts[0].slice(CLAUDE_CODE_PROMPT_PREFIX.length);
+		let sdkIdentity = 0;
+		while (texts[sdkIdentity] !== undefined && isBilling(texts[sdkIdentity])) sdkIdentity++;
+		if (texts[sdkIdentity] === SDK_IDENTITY) texts.splice(0, sdkIdentity + 1);
+		if (texts[0] === CLAUDE_CODE_IDENTITY && texts[1]?.startsWith(CLAUDE_CODE_PROMPT_PREFIX)) {
+			texts.shift();
+			texts[0] = texts[0].slice(CLAUDE_CODE_PROMPT_PREFIX.length);
+		}
 		runtime = texts.join("\n\n");
 	}
-	if (runtime.length > 0 && onlyText(messages[0], "system") !== runtime) {
+	if (runtime.length > 0) {
 		messages.unshift({ role: "system", content: [{ type: "text", text: runtime }] });
 	}
 	return {
