@@ -220,7 +220,8 @@ test("native effort history, thinking fields and later rules survive unchanged",
 	};
 	const before = structuredClone(input);
 	const adapter = claudePayloadAdapter(SESSION_ID);
-	const once = object(await adapter.onPayload(input, claudeModel()));
+	const prepared = adapter.prepare(input, claudeModel(), false);
+	const once = object(prepared.finish(prepared.value));
 	assert.deepEqual(once.thinking, input.thinking);
 	assert.deepEqual(once.output_config, input.output_config);
 	const messages = array(once.messages).map(object);
@@ -229,7 +230,12 @@ test("native effort history, thinking fields and later rules survive unchanged",
 	assert.deepEqual(messages[1].output_config, { effort: "low" });
 	assert.deepEqual(messages[3].output_config, input.messages[2].output_config);
 	assert.deepEqual(input, before);
-	assert.deepEqual(await adapter.onPayload(once, claudeModel()), once);
-	await assert.rejects(adapter.onPayload(null, claudeModel()), /metadata|payload/);
-	await assert.rejects(adapter.onPayload(undefined, claudeModel()), /metadata|payload/);
+	const repeated = adapter.prepare(once, claudeModel(), false);
+	assert.deepEqual(repeated.finish(repeated.value), once);
+	for (const invalid of [null, undefined]) {
+		assert.throws(() => {
+			const invalidPrepared = adapter.prepare(invalid, claudeModel(), false);
+			invalidPrepared.finish(invalidPrepared.value);
+		}, /metadata|payload/);
+	}
 });

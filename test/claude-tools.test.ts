@@ -6,6 +6,53 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { claudeCodeStream, claudeCodeStreamSimple } from "../src/claude/stream.ts";
 import { API_KEY, claudeModel, claudeStart, claudeTextResponse, capture, object, array, sse } from "./fixtures.ts";
 
+test("overlapping Claude requests restore their own tool names after reversed hook completion", { timeout: 10_000 }, async () => {
+	for (const streamClaude of [claudeCodeStream, claudeCodeStreamSimple]) {
+		let entered!: () => void;
+		let release!: () => void;
+		const waiting = new Promise<void>((resolve) => { entered = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const response = () => sse([
+			claudeStart(),
+			{ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "call_shared", name: "Read", input: {} } },
+			{ type: "content_block_stop", index: 0 },
+			{ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } },
+			{ type: "message_stop" },
+		]);
+		const transcript = (name: string) => normalizeContext({
+			tools: [{ name, description: name, parameters: Type.Object({}) }],
+			messages: [{ role: "user", content: "Use the tool", timestamp: 1 }],
+		});
+		const firstFetch = capture(response);
+		const first = streamClaude(claudeModel(), transcript("read"), {
+			apiKey: API_KEY, fetch: firstFetch.fetch,
+			async onPayload() { entered(); await gate; },
+		});
+		await waiting;
+		const secondFetch = capture(response);
+		const second = streamClaude(claudeModel(), transcript("READ"), { apiKey: API_KEY, fetch: secondFetch.fetch });
+		const collect = async (events: typeof first, name: string) => {
+			const observed: string[] = [];
+			for await (const event of events) {
+				const message = "partial" in event ? event.partial : event.type === "done" ? event.message : undefined;
+				for (const block of message?.content ?? []) if (block.type === "toolCall") observed.push(block.name);
+				if (event.type === "toolcall_end") observed.push(event.toolCall.name);
+			}
+			const result = await events.result();
+			assert.equal(result.stopReason, "toolUse", result.errorMessage);
+			assert.ok(observed.length > 0);
+			assert.ok(observed.every((value) => value === name));
+			assert.equal(result.content[0]?.type === "toolCall" && result.content[0].name, name);
+		};
+		await collect(second, "READ");
+		assert.equal(firstFetch.requests.length, 0);
+		release();
+		await collect(first, "read");
+		assert.equal(firstFetch.requests.length, 1);
+		assert.equal(secondFetch.requests.length, 1);
+	}
+});
+
 test("different real identities with a case-insensitive wire collision fail before final fetch", { timeout: 10_000 }, async () => {
 	for (const streamClaude of [claudeCodeStream, claudeCodeStreamSimple]) {
 		for (const names of [["read", "Read"], ["Read", "read"], ["todo_write", "TodoWrite"]]) {
