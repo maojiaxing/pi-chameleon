@@ -60,12 +60,6 @@ export const BASE_URL = "https://relay.example.com";
 // Expected wire facts are deliberately independent from production constants.
 export const CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 export const CODEX_IDENTITY = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.";
-export const CLAUDE_BETAS = [
-	"claude-code-20250219", "context-1m-2025-08-07", "interleaved-thinking-2025-05-14",
-	"thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05",
-	"per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01", "effort-2025-11-24",
-	"thinking-display-updates-2026-08-18", "afk-mode-2026-01-31",
-];
 
 export function object(value: unknown): Record<string, unknown> {
 	assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));

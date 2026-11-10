@@ -1,26 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { DEVICE_ID } from "../identity.ts";
 import type { RelayProfile } from "../relay-transport.ts";
 
-/** Fixed Claude Code 2.1.302 capture. Versioned wire facts live together. */
-const VERSION = "2.1.302";
-const BETAS = [
-	"claude-code-20250219",
-	"context-1m-2025-08-07",
-	"interleaved-thinking-2025-05-14",
-	"thinking-token-count-2026-05-13",
-	"context-management-2025-06-27",
-	"prompt-caching-scope-2026-01-05",
-	"per-turn-control-2026-07-01",
-	"mid-conversation-tool-changes-2026-07-01",
-	"effort-2025-11-24",
-	"thinking-display-updates-2026-08-18",
-	"afk-mode-2026-01-31",
-] as const;
+/** The approved Claude Code request identity. */
+const VERSION = "2.1.274";
 
 /** Native serializer profile matching the user's actual Aether wire capture. */
 export const CLAUDE_SERIALIZER_COMPAT = {
 	supportsMidConvoSystemMessages: true,
-	supportsMidConvoEffort: false,
 	supportsMidConvoToolChanges: false,
 	supportsStrictTools: false,
 	supportsEagerToolInputStreaming: false,
@@ -28,39 +14,62 @@ export const CLAUDE_SERIALIZER_COMPAT = {
 
 export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 export const EPHEMERAL = { type: "ephemeral" } as const;
-export const CONTEXT_MANAGEMENT = {
-	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
-} as const;
-export const THINKING = { type: "adaptive", display: "updates" } as const;
+
+const CONTEXT_BETA = "context-1m-2025-08-07";
+
+export function finalizeClaudePayload(payload: unknown, sessionId: string): unknown {
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+		throw new Error("Claude request metadata cannot be safely normalized");
+	}
+	const body = payload as Record<string, unknown>;
+	const rawMetadata = body.metadata;
+	if (rawMetadata !== undefined && (typeof rawMetadata !== "object" || rawMetadata === null || Array.isArray(rawMetadata))) {
+		throw new Error("Claude request metadata cannot be safely normalized");
+	}
+	const metadata = (rawMetadata ?? {}) as Record<string, unknown>;
+	let userId: Record<string, unknown> = {};
+	if (metadata.user_id !== undefined) {
+		try {
+			const parsed = typeof metadata.user_id === "string" ? JSON.parse(metadata.user_id) : metadata.user_id;
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+			userId = parsed as Record<string, unknown>;
+		} catch {
+			throw new Error("Claude request metadata.user_id cannot be safely normalized");
+		}
+	}
+	return {
+		...body,
+		metadata: {
+			...metadata,
+			user_id: JSON.stringify({ ...userId, device_id: DEVICE_ID, account_uuid: "", session_id: sessionId }),
+		},
+	};
+}
+
+function appendMissingContextBeta(headers: Record<string, string | null>): void {
+	const native = headers["anthropic-beta"];
+	if (typeof native !== "string" || native.trim().length === 0) {
+		headers["anthropic-beta"] = CONTEXT_BETA;
+		return;
+	}
+	if (!native.split(",").some((feature) => feature.trim() === CONTEXT_BETA)) {
+		headers["anthropic-beta"] = `${native},${CONTEXT_BETA}`;
+	}
+}
 
 /** Only the Claude wire differences; shared transport owns credential safety. */
 export const CLAUDE_PROFILE: RelayProfile<"anthropic-messages"> = {
 	provider: "chameleon-claude",
 	api: "anthropic-messages",
 	auth: "x-api-key",
-	rewriteUrl(url) {
-		if (url.pathname.endsWith("/v1/messages")) url.searchParams.set("beta", "true");
-	},
+	protectedHeaders: ["anthropic-beta"],
 	headers(sessionId) {
 		return {
-			accept: "text/event-stream",
-			"accept-encoding": "identity",
-			"anthropic-beta": BETAS.join(","),
-			"anthropic-dangerous-direct-browser-access": "true",
-			"anthropic-version": "2023-06-01",
-			"content-type": "application/json",
 			"user-agent": `claude-cli/${VERSION} (external, cli)`,
 			"x-app": "cli",
-			"x-stainless-arch": "x64",
-			"x-stainless-lang": "js",
-			"x-stainless-os": "Windows",
-			"x-stainless-package-version": "0.128.0",
-			"x-stainless-retry-count": "0",
-			"x-stainless-runtime": "node",
-			"x-stainless-runtime-version": "v26.3.0",
-			"x-stainless-timeout": "60000",
 			"x-claude-code-session-id": sessionId,
-			"x-trace-id": randomUUID(),
 		};
 	},
+	finalizeHeaders: appendMissingContextBeta,
+	finalizeBody: finalizeClaudePayload,
 };

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { ClaudeDiagnostics } from "../claude/diagnostics.ts";
 import { isDeepStrictEqual } from "node:util";
 import type { FetchFunction } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
@@ -28,6 +29,11 @@ const messages: Record<DiscoveryState["status"], string> = {
 /** Pi's public lifecycle is the only source of resolved relay access. */
 export function createChameleonExtension(deps: ChameleonExtensionDependencies = {}): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
+		const diagnostics = new ClaudeDiagnostics();
+		pi.registerCommand("chameleon-diagnostics", {
+			description: "Session-only safe Claude diagnostics: on|off|status",
+			async handler(args, context) { diagnostics.command(args, (message) => context.ui.notify(message, "info")); },
+		});
 		const repository = deps.repository ?? createSnapshotRepository({ directory: deps.directory ?? join(getAgentDir(), "chameleon-model-catalogs") });
 		let ctx: ExtensionContext | undefined;
 		let epoch = 0;
@@ -90,7 +96,7 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 		}
 		function makeProviders() {
 			return families.map((family) => createDiscoveryProvider(family, {
-				...deps, repository, onChange: notify,
+				...deps, repository, onChange: notify, claudeStreams: diagnostics,
 				async resolveAccess() {
 					const bound = ctx;
 					const expected = epoch;
@@ -154,6 +160,7 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 			context.ui.notify(details.join(" "), "info");
 		});
 		pi.on("session_start", (_event, context) => {
+			diagnostics.start(context.sessionManager.getSessionId());
 			epoch++;
 			if (bridgeHandle) clearImmediate(bridgeHandle);
 			bridgeHandle = undefined;
@@ -185,6 +192,7 @@ export function createChameleonExtension(deps: ChameleonExtensionDependencies = 
 			});
 		});
 		pi.on("session_shutdown", () => {
+			diagnostics.shutdown();
 			epoch++;
 			if (bridgeHandle) clearImmediate(bridgeHandle);
 			bridgeHandle = undefined;

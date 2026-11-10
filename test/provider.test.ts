@@ -31,13 +31,14 @@ function syntheticConfig(config: unknown) {
 async function withRuntime(
 	config: unknown,
 	run: (runtime: ModelRuntime, path: string, credentials: InMemoryCredentialStore, providers: Provider[]) => Promise<void>,
+	options: { fixtureModels?: boolean; discoveredModels?: readonly string[] } = {},
 ) {
 	const dir = await mkdtemp(join(tmpdir(), "pi-chameleon-models-config-"));
 	const path = join(dir, "models.json");
 	const credentials = new InMemoryCredentialStore();
 	let session: AgentSession | undefined;
 	try {
-		await writeFile(path, JSON.stringify(syntheticConfig(config)));
+		await writeFile(path, JSON.stringify(options.fixtureModels === false ? config : syntheticConfig(config)));
 		const runtime = await ModelRuntime.create({
 			credentials, modelsPath: path, modelsStore: new InMemoryModelsStore(),
 			allowModelNetwork: false, refreshOnCreate: false,
@@ -57,7 +58,8 @@ async function withRuntime(
 				repository: createSnapshotRepository({ directory: join(dir, "catalogs") }),
 				fetch: async () => {
 					if (++requests === expectedRequests) resolveReady();
-					return Response.json({ data: [...CLAUDE_FIXTURE_MODELS, ...CODEX_FIXTURE_MODELS].map(({ id }) => ({ id })), has_more: false });
+					const ids = options.discoveredModels ?? [...CLAUDE_FIXTURE_MODELS, ...CODEX_FIXTURE_MODELS].map(({ id }) => id);
+					return Response.json({ data: ids.map((id) => ({ id })), has_more: false });
 				},
 			})],
 		});
@@ -122,6 +124,56 @@ test("Pi models.json alone configures both CLI adapters with the same relay key"
 			assert.equal(mock.requests[0].headers.get("user-agent")?.includes("pi/"), false);
 		}
 	});
+});
+
+test("explicit native Claude models without adaptive metadata retain native budget thinking", { timeout: 20_000 }, async () => {
+	const definition = {
+		id: "claude-opus-4-6", name: "Explicit Claude", reasoning: true, input: ["text"],
+		contextWindow: 200_000, maxTokens: 64_000,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+	await withRuntime({ providers: { "chameleon-claude": {
+		api: "anthropic-messages", baseUrl: "https://relay.example.test", apiKey: "synthetic-offline-key",
+		models: [definition],
+	} } }, async (runtime, path) => {
+		const model = runtime.getModel("chameleon-claude", definition.id)!;
+		assert.ok(model);
+		assert.equal(model.compat && "forceAdaptiveThinking" in model.compat ? model.compat.forceAdaptiveThinking : undefined,
+			undefined, "no fixture or discovered capability may mask the missing field");
+		const configBefore = await readFile(path, "utf8");
+		const modelBefore = structuredClone(model);
+		const mock = capture(claudeTextResponse);
+		const result = await runtime.completeSimple(model, context(), { fetch: mock.fetch, reasoning: "high", thinkingBudgets: { high: 2048 }, maxTokens: 2048 });
+		assert.equal(result.stopReason, "stop", result.errorMessage);
+		assert.equal(mock.requests.length, 1);
+		assert.deepEqual(mock.requests[0].body.thinking, { type: "enabled", budget_tokens: 2048, display: "summarized" });
+		assert.equal("output_config" in mock.requests[0].body, false);
+		assert.equal(mock.requests[0].body.max_tokens, 4096, "native budget adjustment reserves output tokens");
+		assert.deepEqual(model, modelBefore);
+		assert.equal(await readFile(path, "utf8"), configBefore, "defaults must not rewrite models.json");
+	}, { fixtureModels: false, discoveredModels: [] });
+});
+
+test("native Claude provider and model compat overrides keep an explicit adaptive false", { timeout: 20_000 }, async () => {
+	for (const overrides of [
+		{ compat: { forceAdaptiveThinking: false } },
+		{ compat: { forceAdaptiveThinking: true }, modelOverrides: { "claude-opus-4-6": { compat: { forceAdaptiveThinking: false } } } },
+	]) {
+		await withRuntime({ providers: { "chameleon-claude": {
+			api: "anthropic-messages", baseUrl: "https://relay.example.test", apiKey: "synthetic-offline-key",
+			models: [{ id: "claude-opus-4-6", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 }],
+			...overrides,
+		} } }, async (runtime) => {
+			const model = runtime.getModel("chameleon-claude", "claude-opus-4-6")!;
+			assert.ok(model.compat && "forceAdaptiveThinking" in model.compat);
+			assert.equal(model.compat.forceAdaptiveThinking, false);
+			const mock = capture(claudeTextResponse);
+			const result = await runtime.completeSimple(model, context(), { fetch: mock.fetch, reasoning: "high" });
+			assert.equal(result.stopReason, "stop", result.errorMessage);
+			assert.deepEqual(mock.requests[0].body.thinking, { type: "enabled", budget_tokens: 16384, display: "summarized" });
+			assert.equal("output_config" in mock.requests[0].body, false);
+		}, { fixtureModels: false, discoveredModels: [] });
+	}
 });
 
 test("native authHeader:true lets both protocols use Bearer without an extension field", { timeout: 20_000 }, async () => {

@@ -1,9 +1,11 @@
 // /compat is explicitly supported by the real Pi extension loader.
+import { randomUUID } from "node:crypto";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
 import type { Api, Model, SimpleStreamOptions, StreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { prepareRelayRequest } from "../relay-transport.ts";
 import { CLAUDE_PROFILE, CLAUDE_SERIALIZER_COMPAT } from "./identity.ts";
 import { claudePayloadAdapter } from "./payload.ts";
+import { resolveClaudeCachePolicy } from "./cache-policy.ts";
 import { restoredStream } from "./tools.ts";
 
 const native = anthropicMessagesApi();
@@ -17,15 +19,36 @@ function streamClaude(
 	if (options && "client" in options && options.client !== undefined) {
 		throw new Error("pi-chameleon uses fetch injection, not a custom Anthropic client");
 	}
-	const request = prepareRelayRequest(CLAUDE_PROFILE, model, options);
-	// Select the native non-strict serializer rather than trying to undo its
-	// required/null schema transformation after it has already lost intent.
+	const requestOptions = options?.sessionId === undefined
+		? { ...options, sessionId: randomUUID() }
+		: options;
+	const request = prepareRelayRequest(CLAUDE_PROFILE, model, requestOptions);
+	// Select the native non-strict serializer while preserving native thinking decisions.
 	const wireModel = {
 		...request.model,
-		compat: { ...request.model.compat, ...CLAUDE_SERIALIZER_COMPAT },
+		compat: {
+			...request.model.compat,
+			...CLAUDE_SERIALIZER_COMPAT,
+		},
 	};
-	const payload = claudePayloadAdapter(request.options.sessionId, options?.onPayload);
-	const events = delegate(wireModel, context, { ...request.options, onPayload: payload.onPayload });
+	const cachePolicy = resolveClaudeCachePolicy(request.options, wireModel);
+	const payload = claudePayloadAdapter(request.options.sessionId, options?.onPayload, cachePolicy);
+	const events = delegate(wireModel, context, {
+		...request.options,
+		cacheRetention: cachePolicy.retention,
+		async onPayload(params, nativeModel) {
+			const nativeParams = params as Record<string, unknown>;
+			const betas = Array.isArray(nativeParams.betas) ? [...nativeParams.betas] : undefined;
+			const adapted = await payload.onPayload(params, nativeModel);
+			if (typeof adapted === "object" && adapted !== null && !Array.isArray(adapted)) {
+				const protectedPayload = { ...adapted } as Record<string, unknown>;
+				if (betas === undefined) delete protectedPayload.betas;
+				else protectedPayload.betas = betas;
+				return protectedPayload;
+			}
+			return adapted;
+		},
+	});
 	return restoredStream(events, payload.fromWire);
 }
 

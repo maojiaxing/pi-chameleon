@@ -1,5 +1,6 @@
 import {
 	createAssistantMessageEventStream,
+	type AssistantMessage,
 	type AssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 
@@ -49,44 +50,51 @@ function wireToolName(name: string): string {
  * - `tool_reference` / `tool_definition` blocks inside system entries
  *   (mid-conversation tool changes)
  *
- * Records wire→Pi mappings into `fromWire`. Unknown objects are traversed
- * generically, so future payload shapes keep working.
+ * Records a unique wire→Pi mapping into `fromWire`. Only protocol containers
+ * are visited; schemas, arguments, nested results and unknown data are opaque.
  */
 export function wireToolNamesDeep(value: unknown, fromWire: Map<string, string>): unknown {
-	if (Array.isArray(value))
-		return value.map((entry) => wireToolNamesDeep(entry, fromWire));
-	if (typeof value !== "object" || value === null) return value;
-	const record = value as Record<string, unknown>;
-
 	const remap = (name: unknown): unknown => {
 		if (typeof name !== "string") return name;
 		const wire = wireToolName(name);
-		if (!fromWire.has(wire.toLowerCase())) fromWire.set(wire.toLowerCase(), name);
+		const key = wire.toLowerCase();
+		const identity = fromWire.get(key);
+		if (identity !== undefined && identity !== name) {
+			throw new Error(`Claude tool wire-name collision: ${JSON.stringify(identity)} and ${JSON.stringify(name)}`);
+		}
+		fromWire.set(key, name);
 		return wire;
 	};
 
-	const clone: Record<string, unknown> = {};
-	for (const [key, child] of Object.entries(record)) {
-		if (
-			key === "name" &&
-			(typeof record.input_schema === "object" ||
-				record.type === "tool_use" ||
-				record.type === "tool_reference" ||
-				record.type === "tool_definition" ||
-				record.type === "tool")
-		) {
-			clone.name = remap(child);
-		} else if (
-			["tools", "messages", "system", "content", "blocks", "tool", "definition", "tool_choice"].includes(key) &&
-			typeof child === "object" && child !== null
-		) {
-			// Only protocol containers: schemas, tool inputs and user data are opaque.
-			clone[key] = wireToolNamesDeep(child, fromWire);
-		} else {
-			clone[key] = child;
+	type Container = "payload" | "message" | "block" | "definition" | "choice";
+	const visit = (entry: unknown, container: Container): unknown => {
+		if (Array.isArray(entry)) return entry.map((child) => visit(child, container));
+		if (typeof entry !== "object" || entry === null) return entry;
+		const record = entry as Record<string, unknown>;
+		const clone = { ...record };
+		if (container === "payload") {
+			if (record.tools !== undefined) clone.tools = visit(record.tools, "definition");
+			if (record.tool_choice !== undefined) clone.tool_choice = visit(record.tool_choice, "choice");
+			if (record.messages !== undefined) clone.messages = visit(record.messages, "message");
+			if (record.system !== undefined) clone.system = visit(record.system, "block");
+		} else if (container === "message") {
+			if (record.content !== undefined) clone.content = visit(record.content, "block");
+		} else if (container === "definition" || (container === "choice" && record.type === "tool")) {
+			if (typeof record.name === "string") clone.name = remap(record.name);
+		} else if (container === "block") {
+			if (["tool_use", "tool_reference", "tool_definition"].includes(String(record.type))) {
+				if (typeof record.name === "string") clone.name = remap(record.name);
+				if (record.type === "tool_definition" && record.definition !== undefined) clone.definition = visit(record.definition, "definition");
+			} else if (record.type === "tool_addition" || record.type === "tool_removal") {
+				if (record.tool !== undefined) clone.tool = visit(record.tool, "block");
+			} else if (record.type === "text" && record.blocks !== undefined) {
+				clone.blocks = visit(record.blocks, "block");
+			}
+			// tool_result.content is result data, not another protocol scope.
 		}
-	}
-	return clone;
+		return clone;
+	};
+	return visit(value, "payload");
 }
 
 /** Recursively restore toolCall names from wire casing back to Pi names. */
@@ -117,15 +125,26 @@ export function restoredStream(
 ): AssistantMessageEventStream {
 	const out = createAssistantMessageEventStream();
 	void (async () => {
+		let latest: AssistantMessage | undefined;
 		try {
 			for await (const event of events) {
+				latest = "partial" in event ? event.partial : event.type === "done" ? event.message : event.type === "error" ? event.error : latest;
 				restoreName(event, fromWire());
 				out.push(event);
 			}
 		} catch {
-			// The inner stream terminates with `error` events rather than throwing;
-			// guard anyway so the outer stream never hangs.
-			out.end();
+			// end(undefined) does not settle Pi's result promise. Emit a terminal
+			// error without copying arbitrary wrapper exception text.
+			const error: AssistantMessage = {
+				...(latest ?? {
+					role: "assistant", api: "anthropic-messages", provider: "chameleon-claude", model: "unknown",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					timestamp: Date.now(),
+				}),
+				content: [], stopReason: "error", errorMessage: "Claude stream tool restoration failed",
+			};
+			out.push({ type: "error", reason: "error", error });
 		}
 	})();
 	return out;

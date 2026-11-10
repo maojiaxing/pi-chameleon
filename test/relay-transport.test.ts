@@ -37,7 +37,15 @@ for (const { profile, model, path } of adapters) {
 		await fetch(new Request(url, { method: "POST", body: '{"fixture":3}', headers: inherited }));
 		for (const [i, request] of captured.entries()) {
 			assert.equal(request.method, "POST");
-			assert.equal(await request.text(), `{"fixture":${i + 1}}`);
+			const body = JSON.parse(await request.text());
+			assert.equal(body.fixture, i + 1);
+			if (profile.api === "anthropic-messages") {
+				const identity = JSON.parse(body.metadata.user_id);
+				assert.equal(identity.session_id, SESSION_ID);
+				assert.equal(identity.account_uuid, "");
+				assert.match(identity.device_id, /^[a-f0-9]{64}$/);
+				assert.deepEqual(Object.keys(body).sort(), ["fixture", "metadata"]);
+			} else assert.deepEqual(body, { fixture: i + 1 });
 			assert.equal(request.redirect, "error");
 			assert.equal(request.headers.get("x-remove"), null);
 			assert.equal(request.headers.get("x-extra"), "caller");
@@ -49,7 +57,7 @@ for (const { profile, model, path } of adapters) {
 			}
 			const routed = new URL(request.url);
 			assert.equal(routed.searchParams.get("route"), "fixture");
-			assert.equal(routed.searchParams.get("beta"), profile.api === "anthropic-messages" ? "true" : null);
+			assert.equal(routed.searchParams.get("beta"), null);
 		}
 		controller.abort();
 		assert.equal(captured[0].signal.aborted, true);
@@ -87,7 +95,8 @@ for (const { profile, model, path } of adapters) {
 		assert.match(a.options.sessionId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
 		assert.equal(b.options.timeoutMs, 12_345);
 		assert.equal(b.options.maxRetries, 2);
-		await Promise.all([a.options.fetch!(`${BASE_URL}${path}`), b.options.fetch!(`${BASE_URL}${path}`)]);
+		const init = { method: "POST", body: "{}" };
+		await Promise.all([a.options.fetch!(`${BASE_URL}${path}`, init), b.options.fetch!(`${BASE_URL}${path}`, init)]);
 		const header = profile.auth === "bearer" ? "authorization" : "x-api-key";
 		assert.deepEqual(captured.map((headers) => headers.get(header)), profile.auth === "bearer" ? ["Bearer key-a", "Bearer key-b"] : ["key-a", "key-b"]);
 		for (const key of [undefined, "", "   "]) assert.throws(() => prepareRelayRequest(profile, model, { apiKey: key }), /No API key/);
@@ -121,13 +130,13 @@ test("shared safety checks also run after an adapter rewrites a URL", async () =
 	assert.equal(calls, 0);
 });
 
-test("base URLs retain Pi semantics; only Claude messages receive the required beta query", async () => {
+test("base URLs and existing query strings retain Pi semantics without forced beta parameters", async () => {
 	for (const baseUrl of [BASE_URL, `${BASE_URL}/gateway/openai/`, `${BASE_URL}/v1/?route=fixture`]) {
 		const request = prepareRelayRequest(CODEX_PROFILE, { ...codexModel(), baseUrl }, { apiKey: API_KEY });
 		assert.equal(request.model.baseUrl, baseUrl);
 	}
 	let url: string | undefined;
 	const request = prepareRelayRequest(CLAUDE_PROFILE, claudeModel(), { apiKey: API_KEY, fetch: async (input) => { url = String(input); return new Response("{}"); } });
-	await request.options.fetch!(`${BASE_URL}/v1/models`);
-	assert.equal(url, `${BASE_URL}/v1/models`);
+	await request.options.fetch!(`${BASE_URL}/v1/messages?route=fixture&beta=caller`, { method: "POST", body: "{}" });
+	assert.equal(url, `${BASE_URL}/v1/messages?route=fixture&beta=caller`);
 });
