@@ -3,11 +3,11 @@ import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { InMemoryCredentialStore, InMemoryModelsStore, type FetchFunction } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, InMemoryModelsStore, type FetchFunction, type Provider, type RefreshModelsContext } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createDiscoveryProvider } from "../src/discovery/provider.ts";
 import { createSnapshotRepository } from "../src/discovery/snapshot.ts";
-import type { DiscoveryAccess, DiscoveryClock, RelayFamily, SnapshotRepository } from "../src/discovery/types.ts";
+import type { DiscoveryAccess, DiscoveryClock, RelayFamily, SnapshotRepository, ChameleonProviderId } from "../src/discovery/types.ts";
 
 const codexId = "chameleon-codex";
 const config = { baseUrl: "https://relay.example.test/gateway/v1", apiKey: "synthetic-list-key", authHeader: true };
@@ -27,6 +27,13 @@ function deferred<T>() {
 	let reject!: (reason: unknown) => void;
 	const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
 	return { promise, resolve, reject };
+}
+function nativeContext(overrides: Partial<RefreshModelsContext> = {}): RefreshModelsContext {
+	return {
+		allowNetwork: false, signal: new AbortController().signal,
+		publish: async ({ update }) => { update?.(); return true; },
+		...overrides,
+	};
 }
 function clock(start = 1_000) {
 	let now = start;
@@ -51,7 +58,7 @@ async function withRuntime(
 	fetch: FetchFunction,
 	run: (h: {
 		runtime: ModelRuntime; registry: ModelRegistry; path: string; repository: SnapshotRepository;
-		credentials: InMemoryCredentialStore; bind(): void; states: string[];
+		credentials: InMemoryCredentialStore; bind(): void; states: string[]; provider: Provider; dispose(): void;
 	}) => Promise<void>,
 	options: { family?: RelayFamily; providerConfig?: unknown; repository?: SnapshotRepository; clock?: DiscoveryClock;
 		resolveAccess?: () => Promise<DiscoveryAccess | undefined> } = {},
@@ -81,7 +88,7 @@ async function withRuntime(
 		await initialized.promise;
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		const registry = new ModelRegistry(runtime);
-		await run({ runtime, registry, path, repository, credentials, states, bind() {
+		await run({ runtime, registry, path, repository, credentials, states, ...discovery, bind() {
 			resolveAccess = options.resolveAccess ?? (async () => {
 				const resolved = await registry.getProviderAuth(id);
 				return resolved ? {
@@ -93,6 +100,243 @@ async function withRuntime(
 	} finally {
 		discovery.dispose();
 		await rm(directory, { recursive: true, force: true });
+	}
+}
+
+for (const family of ["claude", "codex"] as const) {
+	test(`${family}: rejected identity publication retains the old catalog until a permitted restore`, async () => {
+		const id: ChameleonProviderId = `chameleon-${family}`;
+		const prefix = family === "claude" ? "claude" : "gpt";
+		let access: DiscoveryAccess = { baseUrl: config.baseUrl, apiKey: config.apiKey };
+		const net = network({ data: [{ id: `${prefix}-previous` }], has_more: false });
+		await withRuntime(net.fetch, async ({ bind, registry, provider, repository, states }) => {
+			bind();
+			await registry.refresh({ providers: [id], allowNetwork: true, force: true });
+			access = { ...access, headers: { "X-Access": "synthetic-new-scope" } };
+			const identity = await repository.identity({ ...access, headers: { "x-access": "synthetic-new-scope" } });
+			await repository.saveSuccess(id, identity, { checkedAt: 7, records: [{ id: `${prefix}-restored` }] });
+			const before = [...states];
+			await provider.refreshModels!(nativeContext({ publish: async () => false }));
+			assert.deepEqual(provider.getModels().map((model) => model.id), [`${prefix}-previous`]);
+			assert.deepEqual(states, before, "a rejected identity update reports no committed target state");
+			await registry.refresh({ providers: [id], allowNetwork: false });
+			assert.deepEqual(provider.getAllModels!().map((model) => model.id), [`${prefix}-restored`]);
+			assert.equal(states.at(-1), "cache");
+			assert.equal(net.requests.length, 1);
+		}, { family, resolveAccess: async () => access });
+	});
+	test(`${family}: an aborted waiter leaves a completed shared job for the newest cache-only waiter still resolving access`, async () => {
+		const id: ChameleonProviderId = `chameleon-${family}`;
+		const modelId = family === "claude" ? "claude-takeover" : "gpt-takeover";
+		const started = deferred<void>();
+		const response = deferred<Response>();
+		const resolving = deferred<void>();
+		const accessReady = deferred<void>();
+		let delayAccess = false;
+		let requests = 0;
+		let signal: AbortSignal | undefined;
+		await withRuntime(async (_url, init) => {
+			requests++; signal = init?.signal ?? undefined; started.resolve(); return response.promise;
+		}, async ({ bind, registry, provider, repository }) => {
+			bind();
+			await registry.refresh({ providers: [id], allowNetwork: false });
+			const old = new AbortController();
+			const first = provider.refreshModels!(nativeContext({ allowNetwork: true, signal: old.signal }));
+			await started.promise;
+			delayAccess = true;
+			const second = provider.refreshModels!(nativeContext());
+			await resolving.promise;
+			old.abort();
+			response.resolve(Response.json({ data: [{ id: modelId }], has_more: false }));
+			await first;
+			assert.equal(signal?.aborted, false, "cancelled native waiters do not own transport cancellation");
+			accessReady.resolve();
+			await second;
+			assert.equal(requests, 1);
+			assert.deepEqual(provider.getModels().map((model) => model.id), [modelId]);
+			const identity = await repository.identity({ baseUrl: config.baseUrl, apiKey: config.apiKey });
+			assert.deepEqual((await repository.read(id, identity)).snapshot?.records, [{ id: modelId }]);
+		}, { family, resolveAccess: async () => {
+			if (delayAccess) { resolving.resolve(); await accessReady.promise; }
+			return { baseUrl: config.baseUrl, apiKey: config.apiKey };
+		} });
+	});
+	test(`${family}: failed suspension persistence keeps candidates disabled through ordinary failure and restart`, async () => {
+		const id: ChameleonProviderId = `chameleon-${family}`;
+		const modelId = family === "claude" ? "claude-permitted" : "gpt-permitted";
+		const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-suspension-unsaved-"));
+		const access = { baseUrl: config.baseUrl, apiKey: config.apiKey };
+		const repository = createSnapshotRepository({ directory, io: { async rename(from, to) {
+			const staged = JSON.parse(await readFile(from, "utf8"));
+			if (staged.pending === false && staged.suspended) throw new Error("SYNTHETIC_SUSPENSION_WRITE_FAILURE");
+			await rename(from, to);
+		} } });
+		const net = network(
+			{ data: [{ id: modelId }], has_more: false },
+			new Response("synthetic permission failure", { status: family === "claude" ? 401 : 403 }),
+			new Error("synthetic ordinary failure"),
+		);
+		try {
+			await withRuntime(net.fetch, async ({ bind, registry, runtime, states }) => {
+				bind();
+				const refresh = () => registry.refresh({ providers: [id], allowNetwork: true, force: true });
+				await refresh();
+				await refresh();
+				assert.equal(states.at(-1), "suspension-unsaved");
+				assert.deepEqual(runtime.getModels(id), []);
+				await refresh();
+				assert.equal(states.at(-1), "failed");
+				assert.deepEqual(runtime.getModels(id), []);
+			}, { family, repository, resolveAccess: async () => access });
+			const restarted = createSnapshotRepository({ directory });
+			const identity = await restarted.identity(access);
+			const durable = await restarted.read(id, identity);
+			assert.equal(durable.suspended, true);
+			assert.deepEqual(durable.snapshot?.records, [{ id: modelId }]);
+			await withRuntime(network().fetch, async ({ bind, registry, runtime }) => {
+				bind();
+				await registry.refresh({ providers: [id], allowNetwork: false });
+				assert.deepEqual(runtime.getModels(id), []);
+			}, { family, repository: restarted, resolveAccess: async () => access });
+		} finally { await rm(directory, { recursive: true, force: true }); }
+	});
+	test(`${family}: a late save cannot overwrite a forced replacement or its persisted snapshot`, async () => {
+		const id: ChameleonProviderId = `chameleon-${family}`;
+		const prefix = family === "claude" ? "claude" : "gpt";
+		const directory = await mkdtemp(join(tmpdir(), "pi-chameleon-late-provider-save-"));
+		const staged = deferred<void>();
+		const release = deferred<void>();
+		const access = { baseUrl: config.baseUrl, apiKey: config.apiKey };
+		const repository = createSnapshotRepository({ directory, io: { async writeFile(path, bytes, options) {
+			await writeFile(path, bytes, options);
+			if (typeof bytes === "string") {
+				const value = JSON.parse(bytes);
+				if (value.pending === false && value.snapshot?.records[0]?.id === `${prefix}-old-save`) {
+					staged.resolve();
+					await release.promise;
+				}
+			}
+		} } });
+		const net = network(
+			{ data: [{ id: `${prefix}-old-save` }], has_more: false },
+			{ data: [{ id: `${prefix}-replacement` }], has_more: false },
+		);
+		try {
+			await withRuntime(net.fetch, async ({ bind, registry, provider, states }) => {
+				bind();
+				await registry.refresh({ providers: [id], allowNetwork: false });
+				const old = provider.refreshModels!(nativeContext({ allowNetwork: true, force: true }));
+				await staged.promise;
+				assert.deepEqual(provider.getModels().map((model) => model.id), [`${prefix}-old-save`]);
+				await provider.refreshModels!(nativeContext({ allowNetwork: true, force: true }));
+				const before = [...states];
+				release.resolve();
+				await old;
+				assert.deepEqual(states, before, "a late save cannot report completion for a retired waiter");
+				assert.equal(states.at(-1), "success");
+				assert.deepEqual(provider.getModels().map((model) => model.id), [`${prefix}-replacement`]);
+				const identity = await repository.identity(access);
+				assert.deepEqual((await repository.read(id, identity)).snapshot?.records, [{ id: `${prefix}-replacement` }]);
+			}, { family, repository, resolveAccess: async () => access });
+		} finally { release.resolve(); await rm(directory, { recursive: true, force: true }); }
+	});
+	for (const pending of [false, true]) {
+		test(`${family}: dispose clears memory without changing the ${pending ? "pending verification" : "successful snapshot"} on disk`, async () => {
+			const id: ChameleonProviderId = `chameleon-${family}`;
+			const modelId = family === "claude" ? "claude-before-dispose" : "gpt-before-dispose";
+			const access = { baseUrl: config.baseUrl, apiKey: config.apiKey };
+			const started = deferred<void>();
+			const response = deferred<Response>();
+			let requests = 0;
+			let signal: AbortSignal | undefined;
+			await withRuntime(async (_url, init) => {
+				requests++;
+				if (requests === 1) return Response.json({ data: [{ id: modelId }], has_more: false });
+				signal = init?.signal ?? undefined; started.resolve(); return response.promise;
+			}, async ({ bind, registry, provider, dispose, repository, states }) => {
+				bind();
+				await registry.refresh({ providers: [id], allowNetwork: true, force: true });
+				let refreshing: Promise<void> | undefined;
+				if (pending) {
+					refreshing = provider.refreshModels!(nativeContext({ allowNetwork: true, force: true }));
+					await started.promise;
+				}
+				const identity = await repository.identity(access);
+				const durable = await repository.read(id, identity);
+				const before = [...states];
+				dispose();
+				dispose();
+				assert.deepEqual(provider.getModels(), []);
+				assert.deepEqual(provider.getAllModels!(), []);
+				if (pending) assert.equal(signal?.aborted, true);
+				await provider.refreshModels!(nativeContext({ allowNetwork: true, force: true }));
+				response.resolve(Response.json({ data: [{ id: `${modelId}-late` }], has_more: false }));
+				await refreshing;
+				assert.deepEqual(provider.getModels(), []);
+				assert.deepEqual(states, before);
+				assert.equal(requests, pending ? 2 : 1);
+				assert.deepEqual(await repository.read(id, identity), durable);
+				await withRuntime(network().fetch, async ({ bind, registry, runtime }) => {
+					bind();
+					await registry.refresh({ providers: [id], allowNetwork: false });
+					assert.deepEqual(runtime.getModels(id).map((model) => model.id), pending ? [] : [modelId]);
+				}, { family, repository, resolveAccess: async () => access });
+			}, { family, resolveAccess: async () => access });
+		});
+	}
+	test(`${family}: an empty offline variable suppresses even forced network refresh`, async () => {
+		const id: ChameleonProviderId = `chameleon-${family}`;
+		const net = network();
+		const previous = process.env.PI_OFFLINE;
+		process.env.PI_OFFLINE = "";
+		try {
+			await withRuntime(net.fetch, async ({ bind, registry, runtime }) => {
+				bind();
+				await registry.refresh({ providers: [id], allowNetwork: true, force: true });
+				assert.deepEqual(runtime.getModels(id), []);
+				assert.equal(net.requests.length, 0);
+			}, { family });
+		} finally {
+			if (previous === undefined) delete process.env.PI_OFFLINE;
+			else process.env.PI_OFFLINE = previous;
+		}
+	});
+	for (const publication of ["rejected", "invalidated-after-update"] as const) {
+		test(`${family}: ${publication} success publication does not save or announce a completed verification`, async () => {
+			const id: ChameleonProviderId = `chameleon-${family}`;
+			const prefix = family === "claude" ? "claude" : "gpt";
+			const net = network(
+				{ data: [{ id: `${prefix}-previous` }], has_more: false },
+				{ data: [{ id: `${prefix}-target` }], has_more: false },
+			);
+			const access = { baseUrl: config.baseUrl, apiKey: config.apiKey };
+			await withRuntime(net.fetch, async ({ bind, registry, provider, repository, states }) => {
+				bind();
+				await registry.refresh({ providers: [id], allowNetwork: true, force: true });
+				const controller = new AbortController();
+				await provider.refreshModels!(nativeContext({
+					allowNetwork: true, force: true, signal: controller.signal,
+					publish: async ({ update }) => {
+						if (publication === "rejected") return false;
+						update?.();
+						controller.abort();
+						return true;
+					},
+				}));
+				assert.deepEqual(provider.getModels().map((model) => model.id),
+					[`${prefix}-${publication === "rejected" ? "previous" : "target"}`]);
+				assert.equal(states.at(-1), "loading", "neither denied nor invalidated publication completes verification");
+				const identity = await repository.identity(access);
+				const durable = await repository.read(id, identity);
+				assert.deepEqual(durable.snapshot?.records, [{ id: `${prefix}-previous` }]);
+				assert.equal(durable.suspended, true, "the unsaved verification retains its pending barrier");
+				await withRuntime(network().fetch, async ({ bind, registry, runtime }) => {
+					bind();
+					await registry.refresh({ providers: [id], allowNetwork: false });
+					assert.deepEqual(runtime.getModels(id), [], "restart cannot recover the intact previous disk snapshot");
+				}, { family, repository, resolveAccess: async () => access });
+			}, { family, resolveAccess: async () => access });
+		});
 	}
 }
 
