@@ -1,4 +1,5 @@
-import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { AdapterOptions, PreparedPayload } from "../request-lifecycle.ts";
 import { CODEX_IDENTITY } from "./identity.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -69,17 +70,15 @@ function codexPayload(payload: unknown): Record<string, unknown> {
 	};
 }
 
-/** Keep all body policy, including explicit output caps and caller hooks, here. */
-export function codexPayloadAdapter(options?: SimpleStreamOptions): NonNullable<SimpleStreamOptions["onPayload"]> {
-	return async (payload: unknown, model: Model<Api>): Promise<unknown> => {
-		const body = codexPayload(payload);
-		// The native delegate invents a default cap from model.maxTokens;
-		// Codex omits it unless Pi or the model explicitly requested one.
-		if (options?.maxTokens === undefined &&
-			options?.samplingParams?.max_output_tokens === undefined &&
-			model.samplingParams?.max_output_tokens === undefined) {
-			delete body.max_output_tokens;
-		}
-		return (await options?.onPayload?.(body, model)) ?? body;
-	};
+/** Per-callback Responses policy; the shared lifecycle alone invokes hooks. */
+export function prepareCodexPayload(payload: unknown, model: Model<Api>, options?: AdapterOptions): PreparedPayload {
+	const body = codexPayload(payload);
+	// The native delegate invents a default cap from model.maxTokens;
+	// Codex omits it unless Pi or the model explicitly requested one.
+	if (options?.maxTokens === undefined &&
+		options?.samplingParams?.max_output_tokens === undefined &&
+		model.samplingParams?.max_output_tokens === undefined) {
+		delete body.max_output_tokens;
+	}
+	return { value: body, finish: (candidate) => candidate ?? body };
 }

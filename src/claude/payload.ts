@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
-import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { PreparedPayload } from "../request-lifecycle.ts";
 import { finalizeClaudePayload } from "./identity.ts";
 import { resolveClaudeCachePolicy, type ClaudeCachePolicy } from "./cache-policy.ts";
 import { claudeCodePrompt } from "./prompts.ts";
@@ -109,20 +110,30 @@ function validateHook(before: Record<string, unknown>, after: unknown): void {
 }
 
 /** Per-request wire adaptation and tool-name restoration state, not session state. */
-export function claudePayloadAdapter(sessionId: string, hook?: SimpleStreamOptions["onPayload"], policy?: ClaudeCachePolicy) {
+export function claudePayloadAdapter(sessionId: string, policy?: ClaudeCachePolicy) {
 	let names: ReadonlyMap<string, string> = new Map();
 	return {
 		fromWire: () => names,
-		async onPayload(payload: unknown, model: Model<Api>): Promise<unknown> {
+		prepare(payload: unknown, model: Model<Api>, hasHook: boolean): PreparedPayload {
+			const nativeParams = payload as Record<string, unknown>;
+			const betas = Array.isArray(nativeParams?.betas) ? [...nativeParams.betas] : undefined;
 			const adapted = compatiblePayload(payload, sessionId);
 			names = adapted.fromWire;
 			const effective = policy ?? resolveClaudeCachePolicy({}, model);
 			const prepared = alignCacheBreakpoints(adapted.payload, effective);
-			const snapshot = hook ? structuredClone(protectedView(prepared)) : undefined;
-			const replacement = await hook?.(prepared, model);
-			const result = replacement === undefined ? prepared : replacement;
-			if (snapshot) validateHook(snapshot, result);
-			return finalizeClaudePayload(alignCacheBreakpoints(result, effective), sessionId);
+			const snapshot = hasHook ? structuredClone(protectedView(prepared)) : undefined;
+			return {
+				value: prepared,
+				finish(candidate) {
+					if (snapshot) validateHook(snapshot, candidate);
+					const result = finalizeClaudePayload(alignCacheBreakpoints(candidate, effective), sessionId);
+					if (!isRecord(result)) return result;
+					const protectedPayload = { ...result };
+					if (betas === undefined) delete protectedPayload.betas;
+					else protectedPayload.betas = betas;
+					return protectedPayload;
+				},
+			};
 		},
 	};
 }

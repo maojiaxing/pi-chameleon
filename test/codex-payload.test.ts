@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { codexPayloadAdapter } from "../src/codex/payload.ts";
+import { prepareCodexPayload } from "../src/codex/payload.ts";
 import { CODEX_IDENTITY, codexModel, object } from "./fixtures.ts";
 
 // These exercise the internal payload lifecycle used by production, not an
@@ -14,9 +14,10 @@ test("Codex repeated assembly is idempotent and keeps later rules and source dat
 		],
 	};
 	const snapshot = structuredClone(source);
-	const onPayload = codexPayloadAdapter();
-	const once = object(await onPayload(source, codexModel()));
-	const twice = object(await onPayload(once, codexModel()));
+	const prepared = prepareCodexPayload(source, codexModel());
+	const once = object(prepared.finish(prepared.value));
+	const repeated = prepareCodexPayload(once, codexModel());
+	const twice = object(repeated.finish(repeated.value));
 	assert.deepEqual(twice, once);
 	assert.deepEqual(source, snapshot);
 	const input = once.input as Record<string, unknown>[];
@@ -27,7 +28,10 @@ test("Codex repeated assembly is idempotent and keeps later rules and source dat
 });
 
 test("legacy top-level instructions migrate without loss and invalid payload shapes reject", async () => {
-	const adapt = codexPayloadAdapter();
+	const adapt = (payload: unknown, model = codexModel()) => {
+		const prepared = prepareCodexPayload(payload, model);
+		return prepared.finish(prepared.value);
+	};
 	const body = object(await adapt({ model: "gpt-5.5", input: [{ role: "user", content: "hi" }], instructions: "Keep exact rules." }, codexModel()));
 	const input = body.input as Record<string, unknown>[];
 	assert.equal(input[0].content, `${CODEX_IDENTITY}\n\nKeep exact rules.`);
