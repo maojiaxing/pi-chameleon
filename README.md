@@ -314,6 +314,19 @@ pi -e . --list-models chameleon
 | 设置了 `CHAMELEON_*` 但没有生效 | 自定义环境变量配置已移除；按本文迁移到 Pi 原生 `models.json` |
 | 返回 429 或指纹校验失败 | 可能是模型配额、限流或中转站私有规则；模型注册成功不等于服务端兼容 |
 
+## 实现分工
+
+保留四个原有 stream 导出及 raw/simple 的原生委托；模块分工如下：
+
+| 模块 | 职责 |
+| --- | --- |
+| `src/request-lifecycle.ts` | 唯一执行用户 `onPayload`，成对调用 adapter 的 `prepare` / `finish`，并按需还原响应流。 |
+| `src/claude/stream.ts`、`src/claude/payload.ts` | 请求内 adapter、缓存/身份/Beta 处理及工具名称还原。 |
+| `src/codex/stream.ts`、`src/codex/payload.ts` | Responses 适配和原生流委托，不承接 Claude 规则。 |
+| `src/relay-transport.ts` | 受控 fetch、凭据/headers/origin/重定向和最终 profile 校准，独立于 hook 编排。 |
+| `src/discovery/provider.ts`、`src/discovery/lifecycle.ts` | provider 负责每供应商身份恢复、任务准入/接管、成功发布/保存及失败收尾，原生 Provider 接口不变；lifecycle 负责会话 epoch、命令/通知和空闲模型重绑。 |
+| `src/discovery/snapshot.ts`、`src/discovery/storage-security.ts`、`src/discovery/windows-acl.ts`、`src/discovery/catalog.ts` | 前三者保留磁盘 token、权限及跨进程安全职责；catalog 保留分页预算。 |
+
 ## 开发与验证
 
 ```bash

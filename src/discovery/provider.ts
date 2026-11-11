@@ -73,14 +73,18 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 			const current = () => !disposed && latest === context && !context.signal.aborted;
 			let ownedJob: CatalogJob | undefined;
 			let accessResolved = false;
-			try {
+			// Access resolution and disk restoration share one identity boundary. The
+			// resolved flag deliberately changes only after repository.identity succeeds.
+			async function clearUnconfigured() {
+				cancelJob();
+				if (await context.publish({ update: () => {
+					identity = undefined; saved = { suspended: false }; models = []; unsaved = false;
+				} }) && current()) emit("unconfigured");
+			}
+			async function restoreAccess() {
 				const resolved = await deps.resolveAccess();
 				if (!current()) return;
-				if (!resolved) {
-					cancelJob();
-					if (await context.publish({ update: () => { identity = undefined; saved = { suspended: false }; models = []; unsaved = false; } }) && current()) emit("unconfigured");
-					return;
-				}
+				if (!resolved) { await clearUnconfigured(); return; }
 				const access = canonicalAccess(resolved);
 				const nextIdentity = await deps.repository.identity(access);
 				accessResolved = true;
@@ -88,13 +92,20 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 				if (identity !== nextIdentity) {
 					cancelJob();
 					// Clear the previous access boundary before any asynchronous disk restore.
-					if (!await context.publish({ update: () => { identity = nextIdentity; saved = { suspended: false }; models = []; unsaved = false; } })) return;
+					if (!await context.publish({ update: () => {
+						identity = nextIdentity; saved = { suspended: false }; models = []; unsaved = false;
+					} })) return;
 					const restored = await deps.repository.read(id, nextIdentity, { signal: context.signal, isCurrent: current });
 					if (!current()) return;
-					if (!await context.publish({ update: () => { saved = restored; models = restored.suspended || !restored.snapshot ? [] : buildModels(family, access.baseUrl, restored.snapshot.records); } })) return;
+					if (!await context.publish({ update: () => {
+						saved = restored;
+						models = restored.suspended || !restored.snapshot ? [] : buildModels(family, access.baseUrl, restored.snapshot.records);
+					} })) return;
 				}
-				if (!current()) return;
 				// Never reload a same-identity disk copy over a newer in-memory success.
+				return { access, nextIdentity };
+			}
+			function admitJob(access: DiscoveryAccess, nextIdentity: string): CatalogJob | undefined {
 				emit(saved.suspended ? "suspended" : unsaved ? "unsaved" : saved.snapshot ? "cache" : "empty");
 				if (process.env.PI_OFFLINE !== undefined) return;
 				// Cache-only never initiates network, but its newest native context can publish an existing job.
@@ -111,40 +122,55 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 								signal: controller.signal, isCurrent: () => jobCurrent(created),
 							});
 							if (!jobCurrent(created)) throw new CatalogFetchError("cancelled");
-							const records = await fetchCatalog(family, access, { fetch: deps.fetch ?? globalThis.fetch, clock: deps.clock, signal: controller.signal });
+							const records = await fetchCatalog(family, access, {
+								fetch: deps.fetch ?? globalThis.fetch, clock: deps.clock, signal: controller.signal,
+							});
 							return { checkedAt: now(), records };
 						}),
 					};
 					job = created;
 				}
-				ownedJob = job;
-				const active = () => current() && jobCurrent(ownedJob!);
+				return job;
+			}
+			async function acceptSuccess(candidate: CatalogJob, access: DiscoveryAccess) {
+				const active = () => current() && jobCurrent(candidate);
 				emit("loading");
-				const snapshot = await ownedJob.result;
+				const snapshot = await candidate.result;
 				if (!active()) return;
-				if (!await context.publish({ update: () => { saved = { snapshot, suspended: false }; models = buildModels(family, access.baseUrl, snapshot.records); unsaved = true; } }) || !active()) return;
+				if (!await context.publish({ update: () => {
+					saved = { snapshot, suspended: false };
+					models = buildModels(family, access.baseUrl, snapshot.records);
+					unsaved = true;
+				} }) || !active()) return;
+				// Publication is not a durable commit. A failed save retains both the
+				// new memory catalog and the storage barrier; it must never release.
 				try {
-					await deps.repository.saveSuccess(id, ownedJob.identity, snapshot, { token: ownedJob.token, signal: ownedJob.controller.signal, isCurrent: active });
+					await deps.repository.saveSuccess(id, candidate.identity, snapshot, {
+						token: candidate.token, signal: candidate.controller.signal, isCurrent: active,
+					});
 					if (active()) { unsaved = false; emit(snapshot.records.length ? "success" : "empty"); }
 				} catch {
 					if (active()) emit("unsaved");
 				}
-			} catch (error) {
+			}
+			async function finishFailure(error: unknown) {
+				// Failure reporting intentionally uses waiter/revision ownership here,
+				// not the success path's stronger transport/identity guard.
 				if (!current() || (ownedJob && (job !== ownedJob || revision !== ownedJob.revision))) return;
 				if (!accessResolved) {
-					cancelJob();
-					if (await context.publish({ update: () => { identity = undefined; saved = { suspended: false }; models = []; unsaved = false; } }) && current()) emit("unconfigured");
+					await clearUnconfigured();
 					return;
 				}
 				if (error instanceof CatalogFetchError && (error.httpStatus === 401 || error.httpStatus === 403)) {
 					if (!await context.publish({ update: () => { saved = { ...saved, suspended: true }; models = []; } }) || !current()) return;
 					let status: DiscoveryState["status"] = "suspended";
-					try { if (ownedJob) await deps.repository.suspend(id, ownedJob.identity, {
-						token: ownedJob.token, signal: ownedJob.controller.signal, isCurrent: () => current() && jobCurrent(ownedJob!),
-					}); }
-					catch { status = "suspension-unsaved"; }
+					try {
+						if (ownedJob) await deps.repository.suspend(id, ownedJob.identity, {
+							token: ownedJob.token, signal: ownedJob.controller.signal, isCurrent: () => current() && jobCurrent(ownedJob!),
+						});
+					} catch { status = "suspension-unsaved"; }
 					if (current()) emit(status);
-					} else {
+				} else {
 					if (ownedJob?.token && deps.repository.release && jobCurrent(ownedJob)
 						&& !(error instanceof CatalogFetchError && error.code === "cancelled")) {
 						try { await deps.repository.release(id, ownedJob.identity, {
@@ -153,6 +179,14 @@ export function createDiscoveryProvider(family: RelayFamily, deps: DiscoveryProv
 					}
 					if (current()) emit("failed");
 				}
+			}
+			try {
+				const restored = await restoreAccess();
+				if (!restored || !current()) return;
+				ownedJob = admitJob(restored.access, restored.nextIdentity);
+				if (ownedJob) await acceptSuccess(ownedJob, restored.access);
+			} catch (error) {
+				await finishFailure(error);
 			} finally {
 				// A superseded waiter cannot release a job the latest waiter is about to join.
 				if (ownedJob && job === ownedJob && (current() || !latest || latest.signal.aborted)) job = undefined;

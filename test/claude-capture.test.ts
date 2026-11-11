@@ -74,8 +74,10 @@ test("message-system migration is idempotent and keeps later system turns and so
 	};
 	const before = structuredClone(source);
 	const adapter = claudePayloadAdapter(SESSION_ID);
-	const once = object(await adapter.onPayload(source, claudeModel()));
-	const twice = object(await adapter.onPayload(once, claudeModel()));
+	const prepared = adapter.prepare(source, claudeModel(), false);
+	const once = object(prepared.finish(prepared.value));
+	const repeated = adapter.prepare(once, claudeModel(), false);
+	const twice = object(repeated.finish(repeated.value));
 	assert.deepEqual(twice, once);
 	assert.deepEqual(source, before);
 	const messages = array(once.messages).map(object);
@@ -135,7 +137,8 @@ test("capture cache placement preserves schema/input data and runs after caller 
 			role: "user", content: [{ type: "text", text: `hook-${i}`, cache_control: CACHE }],
 		}))] };
 	};
-	const body = object(await claudePayloadAdapter(SESSION_ID, hook).onPayload(source, claudeModel()));
+	const prepared = claudePayloadAdapter(SESSION_ID).prepare(source, claudeModel(), true);
+	const body = object(prepared.finish(hook(prepared.value)));
 	const slots = cacheLocations(body);
 	assert.equal(slots.length, 4);
 	assert.deepEqual(slots.slice(0, 3), ["system:0", "system:1", "tools:1"]);
@@ -259,7 +262,7 @@ test("HTTP 200 with a refusal stop remains an error, not a successful conversati
 
 test("serialized instruction-only messages cannot shift the effective cache marker away from actual tool results", async () => {
 	const adapter = claudePayloadAdapter(SESSION_ID);
-	const body = object(await adapter.onPayload({
+	const prepared = adapter.prepare({
 		system: runtime,
 		messages: [
 			{ role: "user", content: "read this file" },
@@ -267,14 +270,16 @@ test("serialized instruction-only messages cannot shift the effective cache mark
 			{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_fixture", content: "file output" }] },
 			{ role: "system", content: [{ type: "text", text: "Keep later project rules." }], output_config: { effort: "high" } },
 		],
-	}, claudeModel()));
+	}, claudeModel(), false);
+	const body = object(prepared.finish(prepared.value));
 	const messages = array(body.messages).map(object);
 	assert.deepEqual(messages.map((message) => message.role), ["system", "user", "assistant", "user", "system"]);
 	assert.equal(object(array(messages[3].content)[0]).tool_use_id, "toolu_fixture");
 	assert.equal(object(array(messages[4].content)[0]).text, "Keep later project rules.");
 	assert.deepEqual(messages[4].output_config, { effort: "high" });
 	assert.deepEqual(cacheLocations(body), ["system:0", "system:1", "message:3:0"]);
-	assert.deepEqual(await adapter.onPayload(body, claudeModel()), body);
+	const repeated = adapter.prepare(body, claudeModel(), false);
+	assert.deepEqual(repeated.finish(repeated.value), body);
 });
 
 test("caller cap and effort remain caller-selected instead of being forced to the sample values", async () => {

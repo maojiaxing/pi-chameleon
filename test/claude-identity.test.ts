@@ -14,9 +14,9 @@ test("pre-hook identity normalization preserves opaque metadata and user_id extr
 		},
 	};
 	const before = structuredClone(source);
-	let calls = 0;
-	const adapter = claudePayloadAdapter(SESSION_ID, (payload) => {
-		calls++;
+	const adapter = claudePayloadAdapter(SESSION_ID);
+	const prepared = adapter.prepare(source, claudeModel(), true);
+	const mutate = (payload: unknown) => {
 		const metadata = object(object(payload).metadata);
 		const identity = JSON.parse(String(metadata.user_id));
 		assert.deepEqual(metadata.trace, { request: "keep-metadata" });
@@ -26,10 +26,10 @@ test("pre-hook identity normalization preserves opaque metadata and user_id extr
 		assert.notEqual(identity.device_id, "replace");
 		metadata.hook = "allowed";
 		metadata.user_id = JSON.stringify({ ...identity, session_id: "hook-must-not-override" });
-	});
-	const result = object(await adapter.onPayload(source, claudeModel()));
+	};
+	mutate(prepared.value);
+	const result = object(prepared.finish(prepared.value));
 	const metadata = object(result.metadata);
-	assert.equal(calls, 1);
 	assert.equal(metadata.hook, "allowed");
 	assert.deepEqual(metadata.trace, source.metadata.trace);
 	assert.deepEqual(JSON.parse(String(metadata.user_id)).extra, { values: ["keep-user-id"] });
